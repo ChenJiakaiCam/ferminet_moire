@@ -1,0 +1,80 @@
+#!/bin/bash
+#SBATCH --job-name=antigravity_fn_li_train
+#SBATCH --output=slurm_%x_%j.out
+#SBATCH --account=neuralwf
+#SBATCH --partition=booster
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:4
+#SBATCH --cpus-per-task=288
+#SBATCH --time=00:30:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=j.chen26@imperial.ac.uk
+#SBATCH --chdir=/e/project1/neuralwf/jiakai/ferminet
+
+set -e
+set -o pipefail
+
+# Modules used to create the Jupiter FermiNet environment.
+module --force purge
+module load Stages/2025
+module load GCCcore/.13.3.0
+module load Python/3.12.3
+
+export FERMINET_ROOT=/e/project1/neuralwf/jiakai/ferminet
+source "$FERMINET_ROOT/venv/bin/activate"
+cd "$FERMINET_ROOT"
+
+# One process controls all four GPUs.
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+export JAX_PLATFORMS=cuda
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=32
+export JAX_LOG_COMPILES=0
+
+# Separate compilation cache for Jupiter.
+export JAX_COMPILATION_CACHE_DIR="$FERMINET_ROOT/jax_cache/jupiter/li_test"
+export JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1
+mkdir -p "$JAX_COMPILATION_CACHE_DIR"
+
+RUN_DIR="$FERMINET_ROOT/runs/li_test"
+mkdir -p "$RUN_DIR"
+
+scontrol show hostnames "$SLURM_JOB_NODELIST" \
+    > "machine.file.$SLURM_JOB_ID"
+
+echo "Job ID: $SLURM_JOB_ID"
+echo "Date: $(date)"
+echo "Working directory: $PWD"
+echo "Python: $(command -v python)"
+echo "CPUs per process: $SLURM_CPUS_PER_TASK"
+echo "OMP threads: $OMP_NUM_THREADS"
+echo "Run directory: $RUN_DIR"
+echo "Allocated nodes:"
+cat "machine.file.$SLURM_JOB_ID"
+
+CMD=(
+    ferminet
+    --config "$FERMINET_ROOT/ferminet/configs/atom.py"
+    --config.system.atom Li
+    --config.batch_size 256
+    "--config.log.save_path=$RUN_DIR"
+    "--config.log.restore_path=$RUN_DIR"
+    --config.pretrain.iterations=100
+    --config.optim.iterations=10000
+    --config.log.save_frequency=0.5
+)
+
+printf 'Executing: '
+printf '%q ' "${CMD[@]}"
+printf '\n'
+
+srun \
+    --mpi=none \
+    --ntasks=1 \
+    --ntasks-per-node=1 \
+    --cpus-per-task="$SLURM_CPUS_PER_TASK" \
+    --gpus-per-task=4 \
+    --kill-on-bad-exit=1 \
+    "${CMD[@]}"

@@ -2,3 +2,11 @@
 *.egg-info
 *.csv
 *.npz
+venv/
+.venv/
+__pycache__/
+runs/
+slurm-*.out
+slurm_*.out
+machine.file.*
+jax_cache/
