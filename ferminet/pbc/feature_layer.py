@@ -35,12 +35,17 @@ def periodic_norm(metric: jnp.ndarray, scaled_r: jnp.ndarray) -> jnp.ndarray:
     scaled_r: vectors in fractional coordinates of the lattice cell, with
       trailing dimension ndim, to compute the periodic norm of.
   """
+  return jnp.sqrt(periodic_norm_sq(metric, scaled_r))
+
+
+def periodic_norm_sq(metric: jnp.ndarray, scaled_r: jnp.ndarray) -> jnp.ndarray:
+  """Returns the squared periodic norm of a set of vectors without sqrt."""
   chex.assert_rank(metric, expected_ranks=2)
-  a = (1 - jnp.cos(2 * jnp.pi * scaled_r))
+  a = 1 - jnp.cos(2 * jnp.pi * scaled_r)
   b = jnp.sin(2 * jnp.pi * scaled_r)
   cos_term = jnp.einsum('...m,mn,...n->...', a, metric, a)
   sin_term = jnp.einsum('...m,mn,...n->...', b, metric, b)
-  return (1 / (2 * jnp.pi)) * jnp.sqrt(cos_term + sin_term)
+  return (1 / (2 * jnp.pi) ** 2) * (cos_term + sin_term)
 
 
 def make_pbc_feature_layer(
@@ -50,13 +55,15 @@ def make_pbc_feature_layer(
     rescale_inputs: bool = False,
     lattice: Optional[jnp.ndarray] = None,
     include_r_ae: bool = True,
+    interlayer_distance: float = 0.0,
     **kwargs: Any,
 ) -> networks.FeatureLayer:
   """Returns the init and apply functions for periodic features.
 
   Args:
       natoms: number of atoms.
-      nspins: tuple of the number of spin-up and spin-down electrons.
+      nspins: tuple of the number of particles in each spin/species channel,
+        e.g. ``(n_up, n_down)`` or ``(n_e_up, n_e_down, n_h_up, n_h_down)``.
       ndim: dimension of the system.
       rescale_inputs: If true, rescales r_ae for stability. Note that unlike in
         the OBC case, we do not rescale r_ee as well.
@@ -66,10 +73,14 @@ def make_pbc_feature_layer(
         to avoid cusps with ghost atoms in, e.g., homogeneous electron gas. If
         not needed, set cfg.network.make_feature_layer_kwargs['include_r_ae'] =
         False
+      interlayer_distance: Optional out-of-plane bilayer separation ``d >= 0``.
+        When positive and ``nspins`` has length 2 or 4, interlayer electron-hole
+        pair distance features use the 3D distance
+        ``sqrt(r_periodic^2 + d^2)``.
       **kwargs: Unused additional keyword arguments.
   """
 
-  del nspins, kwargs
+  del kwargs
 
   if lattice is None:
     lattice = jnp.eye(ndim)
@@ -77,6 +88,23 @@ def make_pbc_feature_layer(
   # Calculate reciprocal vectors, factor 2pi omitted
   reciprocal_vecs = jnp.linalg.inv(lattice)
   lattice_metric = lattice.T @ lattice
+
+  z_sq = None
+  if interlayer_distance > 0.0 and nspins is not None:
+    if len(nspins) == 4:
+      n_lower = int(nspins[0]) + int(nspins[1])
+    elif len(nspins) == 2:
+      n_lower = int(nspins[0])
+    else:
+      raise ValueError(
+          'interlayer_distance > 0 in make_pbc_feature_layer requires '
+          f'len(nspins) in (2, 4), got nspins={nspins}.'
+      )
+    n_total = sum(int(x) for x in nspins)
+    z = float(interlayer_distance) * jnp.ones((n_total, n_total))
+    z = z.at[:n_lower, :n_lower].set(0.0)
+    z = z.at[n_lower:, n_lower:].set(0.0)
+    z_sq = z**2
 
   def init() -> Tuple[Tuple[int, int], networks.Param]:
     if include_r_ae:
@@ -104,7 +132,14 @@ def make_pbc_feature_layer(
     # Don't take gradients through |0|
     n = ee.shape[0]
     s_ee += jnp.eye(n)[..., None]
-    r_ee = periodic_norm(lattice_metric, s_ee) * (1.0 - jnp.eye(n))
+    if z_sq is not None:
+      r_ee_sq = periodic_norm_sq(lattice_metric, s_ee)
+      r_ee = jnp.sqrt(r_ee_sq + z_sq.astype(r_ee_sq.dtype)) * (
+          1.0 - jnp.eye(n, dtype=r_ee_sq.dtype)
+      )
+    else:
+      r_ee_2d = periodic_norm(lattice_metric, s_ee)
+      r_ee = r_ee_2d * (1.0 - jnp.eye(n, dtype=r_ee_2d.dtype))
 
     if include_r_ae:
       ae_features = jnp.concatenate((r_ae[..., None], ae), axis=2)
