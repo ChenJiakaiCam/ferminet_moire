@@ -116,7 +116,7 @@ def make_kpoints(
   ordinals = sorted(range(-max_k, max_k+1), key=abs)
   ordinals = jnp.asarray(list(itertools.product(ordinals, repeat=ndim)))
 
-  kpoints = ordinals @ rec_lattice.T
+  kpoints = ordinals @ rec_lattice
   kpoints = jnp.asarray(sorted(kpoints, key=jnp.linalg.norm))
   k_norms = jnp.linalg.norm(kpoints, axis=1)
 
