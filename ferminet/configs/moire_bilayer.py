@@ -251,26 +251,26 @@ def get_config() -> ml_collections.ConfigDict:
       # directly, pass an explicit 4- or 2-tuple in 'nspins', or set total layer
       # counts 'n_electrons' / 'n_holes' (with 'spin_polarized' = False/True).
       
-      'n_electrons_up': 2, #Particle number per simulation supercell, not per moire unit cell!
-      'n_electrons_down': 2,
-      'n_holes_up': 2,
-      'n_holes_down': 2,
+      'n_electrons_up': 3, #Particle number per simulation supercell, not per moire unit cell!
+      'n_electrons_down': 3,
+      'n_holes_up': 3,
+      'n_holes_down': 3,
       'nspins': None,
       'n_electrons': None,
       'n_holes': None,
       'spin_polarized': False,
       # Effective masses m_e^* / m_0 and m_h^* / m_0.
-      'mass_e': 0.5,
-      'mass_h': 0.6,
+      'mass_e': 0.70,
+      'mass_h': 0.45,
       
       
       # Out-of-plane separation d between electron (z=0) and hole (z=d) layers.
-      'interlayer_distance': 10.0,
+      'interlayer_distance': 37.79,
       # Primitive moire lattice constant a_M (Bohr) and optional explicit (2, 2)
       # column-vector lattice matrices.
-      'lattice_constant': 100.0,
+      'lattice_constant': 151.18,
       'primitive_lattice': None, # So triangular lattice with lattice_constant automatically set up
-      'supercell_matrix': ((2, 0), (0, 2)),
+      'supercell_matrix': ((6, 0), (0, 3)),
       'supercell_lattice': None, # So 2x2 moire unit cells in a supercell
       'moire_lattice_e': None, # So both potentials use the moire primitive triangular lattice, not the larger supercell lattice!
       'moire_lattice_h': None,
@@ -278,16 +278,16 @@ def get_config() -> ml_collections.ConfigDict:
       
       # Separate electron and hole moire potential parameters:
       # V_alpha(r) = 2 * v_alpha * sum_{m=1}^3 cos(g_m . (r - offset_alpha) + phi_alpha)
-      'v_e': 5.0e-4,
-      'v_h': 5.0e-4,
+      'v_e': 0.0,
+      'v_h': -5.512e-4,
       'phi_e': 0.0,
-      'phi_h': 0.0,
+      'phi_h': float(np.pi / 4.0),
       'offset_e': (0.0, 0.0),
       'offset_h': (0.0, 0.0),
       
       
       # Screened Coulomb interaction and 2D Ewald convergence settings.
-      'dielectric_constant': 10.0,
+      'dielectric_constant': 5.7,
       'ewald_gmax': 100, #Search range for the k-space Ewald sum. Apparently with our choice of alpha this is more than enough?
       'nlatvec': 1, #Sets the range of real-space Ewald sum. Here we sum the 3x3 nearest periodic images of the supercell.
       'ewald_alpha': None, # Defaults to 5.0/h_min, which was also used in pyQMC and JaQMC
