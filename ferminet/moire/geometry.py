@@ -20,6 +20,21 @@ import numpy as np
 
 Array = Union[np.ndarray, jnp.ndarray] #i.e. either numpy or JAX array
 
+def validate_nonnegative_int(value: object, name: str = 'count') -> int:
+  if isinstance(value, (bool, np.bool_)):
+    raise ValueError(f'{name} must be a non-negative integer, got {value!r}.')
+  if isinstance(value, (int, np.integer)):
+    int_val = int(value)
+  elif isinstance(value, (float, np.floating)):
+    if not np.isfinite(value) or not float(value).is_integer():
+      raise ValueError(f'{name} must be an integer, got {value!r}.')
+    int_val = int(value)
+  else:
+    raise ValueError(f'{name} must be a non-negative integer, got {value!r}.')
+  if int_val < 0:
+    raise ValueError(f'{name} must be >= 0, got {value!r}.')
+  return int_val
+
 def layer_particle_counts(nspins: Sequence[int]) -> Tuple[int, int]:
   """Resolves total (n_electrons, n_holes) from 4- or 2-channel ``nspins``.
 
@@ -37,7 +52,7 @@ def layer_particle_counts(nspins: Sequence[int]) -> Tuple[int, int]:
   Raises:
     ValueError: If ``len(nspins)`` is not 2 or 4, or if any count is negative.
   """
-  counts = [int(n) for n in nspins]
+  counts = [validate_nonnegative_int(n, 'nspins entry') for n in nspins]
   if any(n < 0 for n in counts):
     raise ValueError(f'All entries in nspins must be >= 0, got {nspins}.')
   if len(counts) == 4:
@@ -416,12 +431,21 @@ def make_minimum_image_distance_fn(lattice: Array):
     frac_diff = diff @ inv_reduced.T
     wrapped = diff - jnp.round(frac_diff) @ reduced.T
     diff_all = wrapped[..., None, :] + shifts
-    dists_all = jnp.linalg.norm(diff_all, axis=-1)
-    min_idx = jnp.argmin(dists_all, axis=-1)
+    # dists_all = jnp.linalg.norm(diff_all, axis=-1)
+    # min_idx = jnp.argmin(dists_all, axis=-1)
+    dists_sq_all = jnp.sum(diff_all**2, axis=-1) #Avoid linalg.norm which can have reverse AD NaNs
+    min_idx = jnp.argmin(dists_sq_all, axis=-1)
     best_disp = jnp.take_along_axis(
         diff_all, min_idx[..., None, None], axis=-2
     )[..., 0, :]
-    best_dist = jnp.linalg.norm(best_disp, axis=-1)
+    # best_dist = jnp.linalg.norm(best_disp, axis=-1)
+    best_dist_sq = jnp.sum(best_disp**2, axis=-1)
+    zero_mask = best_dist_sq == 0.0
+    best_dist = jnp.where(
+        zero_mask,
+        0.0,
+        jnp.sqrt(jnp.where(zero_mask, 1.0, best_dist_sq)),
+    )
     return best_disp, best_dist # Displacement vector and distance from the nearest periodic image of pos_b to pos_a
 
   return distance_fn

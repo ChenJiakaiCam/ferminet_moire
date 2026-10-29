@@ -133,21 +133,22 @@ def make_pbc_feature_layer(
       r_ae = jnp.log(1 + r_ae)
     # Don't take gradients through |0|
     n = ee.shape[0]
-    s_ee += jnp.eye(n)[..., None]
+    # s_ee += jnp.eye(n)[..., None]
+    r_ee_sq = periodic_norm_sq(lattice_metric, s_ee) #Avoided adding 1 to periodic fractional coordinate (which was used in OBC) since shifting s by 1 will make periodic coordinates back to 0
+    eye = jnp.eye(n, dtype=r_ee_sq.dtype)
     
     if z_sq is not None:
-      r_ee_sq = periodic_norm_sq(lattice_metric, s_ee)
+      # r_ee_sq = periodic_norm_sq(lattice_metric, s_ee)
       # r_ee is a periodic scalar distance feature between particle i and j
       # So here essentially we're replacing the original periodic distance feature r_ij with 
       # sqrt(r_ij^2 + d^2) where d is the actual interlayer distance
       # Rationale is that firstly the original periodic distance feature Taylor expands to the real distance at small in-plane separation r, and here we preserved that property
       # Secondly this also removes the cusp when two particles on different layers have vanishing in-plane separation
-      r_ee = jnp.sqrt(r_ee_sq + z_sq.astype(r_ee_sq.dtype)) * (
-          1.0 - jnp.eye(n, dtype=r_ee_sq.dtype)
+      r_ee = jnp.sqrt(r_ee_sq + z_sq.astype(r_ee_sq.dtype) + eye) * (
+          1.0 - eye
       ) 
     else:
-      r_ee_2d = periodic_norm(lattice_metric, s_ee)
-      r_ee = r_ee_2d * (1.0 - jnp.eye(n, dtype=r_ee_2d.dtype))
+      r_ee = jnp.sqrt(r_ee_sq + eye) * (1.0 - eye)
 
     if include_r_ae:
       ae_features = jnp.concatenate((r_ae[..., None], ae), axis=2)

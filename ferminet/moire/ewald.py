@@ -169,7 +169,7 @@ class BilayerEwaldSum:
     indices = np.stack([grid[0].ravel(), grid[1].ravel()], axis=-1) #Shape ((2*nlatvec+1)^2, 2) i.e. all supercell periodic image indices
     
     self.lattice_displacements = jnp.asarray( # displacements to the periodic images
-        indices @ self.latvec_np.T, dtype=jnp.float32
+        indices @ self.latvec_np.T
     )
     
     # From meshgrid the 0's of both grid[0] and grid[1] are in the center, so after np.stack it's at position (2*nlatvec+1)*nlatvec + nlatvec
@@ -273,7 +273,8 @@ class BilayerEwaldSum:
     displacements, _ = self.dist_fn(coords, coords) 
     # Displacement vectors from a particle to another particle's set of periodic images, starting from the shortest vector, shape (n_images, N, N, 2)
     rvec = displacements[None, ...] + lat_disp[:, None, None, :]
-    r = jnp.linalg.norm(rvec, axis=-1) # Shape (n_images, N, N, 2)
+    # r = jnp.linalg.norm(rvec, axis=-1) # Shape (n_images, N, N, 2)
+    r_sq = jnp.sum(rvec**2, axis=-1) # Shape (n_images, N, N, 2) #Avoided using lingalg.norm which evaluate sqrt(r^2) before mask, which can cause reverse AD NaNs
     
     n_imgs = lat_disp.shape[0]
     # Mask gives interactions between pairs of particles (including periodic images) to be included
@@ -283,7 +284,9 @@ class BilayerEwaldSum:
 
     # Same values as in r, but where r = 0 (mask = 0) we replace 0 with 1 (dummy) because later we need division by r. Doesn't matter because later multiplying by mask removes this entry. 
     # Also numerically cap the lowest distance between two particles, doens't matter because it's far below physical length scale. 
-    r_safe = jnp.where(mask < 0.5, 1.0, jnp.maximum(r, 1e-12))
+    # r_safe = jnp.where(mask < 0.5, 1.0, jnp.maximum(r, 1e-12))
+    r_sq_safe = jnp.where(mask < 0.5, 1.0, jnp.maximum(r_sq, 1e-24))
+    r_safe = jnp.sqrt(r_sq_safe)
     
     pot_term = jax.lax.erfc(self.alpha * r_safe) / r_safe
     v_real = 0.5 * jnp.sum(pot_term * mask)
@@ -322,8 +325,10 @@ class BilayerEwaldSum:
     
     displacements, _ = self.dist_fn(pos_e, pos_h)  # Minimum-image distances, shape (n_e, n_h, 2)
     rvec = displacements[None, ...] + lat_disp[:, None, None, :]
-    r_3d = jnp.sqrt(jnp.sum(rvec**2, axis=-1) + d_sq) #jnp.sum is just summing delta_x^2 + delta_y^2
-    r_safe = jnp.maximum(r_3d, 1e-12)
+    # r_3d = jnp.sqrt(jnp.sum(rvec**2, axis=-1) + d_sq) #jnp.sum is just summing delta_x^2 + delta_y^2
+    # r_safe = jnp.maximum(r_3d, 1e-12)
+    r_3d_sq = jnp.sum(rvec**2, axis=-1) + d_sq #jnp.sum is just summing delta_x^2 + delta_y^2
+    r_safe = jnp.sqrt(jnp.maximum(r_3d_sq, 1e-24))
     v_real = -jnp.sum(jax.lax.erfc(self.alpha * r_safe) / r_safe)
 
     #U_recip = -2*Sum over half-space g points of (W_d(G)* Re[S_e(G)S_h(G)*])

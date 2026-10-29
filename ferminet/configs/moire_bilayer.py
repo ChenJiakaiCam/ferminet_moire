@@ -25,7 +25,10 @@ def _resolve_moire_nspins(
   # mcfg = cfg.system.moire, containing the moire bilayer settings like particle counts, effective masses, lattices, etc
   
   if mcfg.get('nspins') is not None:
-    nspins = tuple(int(x) for x in mcfg.nspins)
+    nspins = tuple(
+        geometry.validate_nonnegative_int(x, 'moire.nspins entry')
+        for x in mcfg.nspins
+    )
     geometry.layer_particle_counts(nspins) #Just a check that nspins is length 2 or 4 and have nonnegative elements
     return nspins
 
@@ -34,28 +37,40 @@ def _resolve_moire_nspins(
   spin_polarized = bool(mcfg.get('spin_polarized', False))
 
   if mcfg.get('n_electrons') is not None:
-    n_e_total = int(mcfg.n_electrons)
+    n_e_total = geometry.validate_nonnegative_int(
+        mcfg.n_electrons, 'moire.n_electrons'
+    )
     if spin_polarized:
       n_e_up, n_e_down = n_e_total, 0
     else:
       n_e_up = n_e_total - (n_e_total // 2)
       n_e_down = n_e_total // 2
   else:
-    n_e_up = int(mcfg.get('n_electrons_up', 2))
-    n_e_down = int(mcfg.get('n_electrons_down', 2))
+    n_e_up = geometry.validate_nonnegative_int(
+        mcfg.get('n_electrons_up', 2), 'moire.n_electrons_up'
+    )
+    n_e_down = geometry.validate_nonnegative_int(
+        mcfg.get('n_electrons_down', 2), 'moire.n_electrons_down'
+    )
     if spin_polarized:
       n_e_up, n_e_down = n_e_up + n_e_down, 0
 
   if mcfg.get('n_holes') is not None:
-    n_h_total = int(mcfg.n_holes)
+    n_h_total = geometry.validate_nonnegative_int(
+        mcfg.n_holes, 'moire.n_holes'
+    )
     if spin_polarized:
       n_h_up, n_h_down = n_h_total, 0
     else:
       n_h_up = n_h_total - (n_h_total // 2)
       n_h_down = n_h_total // 2
   else:
-    n_h_up = int(mcfg.get('n_holes_up', 2))
-    n_h_down = int(mcfg.get('n_holes_down', 2))
+    n_h_up = geometry.validate_nonnegative_int(
+        mcfg.get('n_holes_up', 2), 'moire.n_holes_up'
+    )
+    n_h_down = geometry.validate_nonnegative_int(
+        mcfg.get('n_holes_down', 2), 'moire.n_holes_down'
+    )
     if spin_polarized:
       n_h_up, n_h_down = n_h_up + n_h_down, 0
 
@@ -115,13 +130,16 @@ def _configure_moire_system(
   )
   
   # Both moire potentials must be commensurate with the simulation supercell.
-  geometry.validate_commensurate(lat_e, sim_lattice)
-  geometry.validate_commensurate(lat_h, sim_lattice)
+  if float(mcfg.v_e) != 0.0:
+    geometry.validate_commensurate(lat_e, sim_lattice)
+  if float(mcfg.v_h) != 0.0:
+    geometry.validate_commensurate(lat_h, sim_lattice)
   
   with cfg.ignore_type(): #I think ignore_type() may not actually be necessasry?
     cfg.system.lattice = sim_lattice #Supercell lattice 
-    cfg.system.make_local_energy_fn = 'ferminet.moire.hamiltonian.local_energy'
-    cfg.system.make_local_energy_kwargs = {
+    if not cfg.system.make_local_energy_fn:
+      cfg.system.make_local_energy_fn = 'ferminet.moire.hamiltonian.local_energy'
+    local_energy_defaults = {
         'lattice': sim_lattice,
         'moire_lattice': prim_lattice,
         'moire_lattice_e': lat_e,
@@ -145,25 +163,57 @@ def _configure_moire_system(
             mcfg.get('allow_charged_capacitor', False)
         ),
     }
+    local_energy_kwargs = dict(cfg.system.make_local_energy_kwargs)
+    local_energy_kwargs.update(local_energy_defaults)
+    cfg.system.make_local_energy_kwargs = local_energy_kwargs
     
-    cfg.network.make_feature_layer_fn = (
+    if not cfg.network.make_feature_layer_fn:
+      cfg.network.make_feature_layer_fn = (
           'ferminet.pbc.feature_layer.make_pbc_feature_layer'
       )
-    cfg.network.make_feature_layer_kwargs = {
+    feature_layer_kwargs = dict(cfg.network.make_feature_layer_kwargs)
+    feature_layer_kwargs.setdefault('include_r_ae', False) #r_ae (atom-electron) gives the network a scalar atom-electron distance i.e. a cusp, which we don't want here
+    feature_layer_kwargs.update({
         'lattice': sim_lattice,
-        'include_r_ae': False, #r_ae (atom-electron) gives the network a scalar atom-electron distance i.e. a cusp, which we don't want here
+        # 'include_r_ae': False, #r_ae (atom-electron) gives the network a scalar atom-electron distance i.e. a cusp, which we don't want here
         'interlayer_distance': float(mcfg.interlayer_distance),
-    }
-    cfg.network.jastrow_kwargs = {
-          'mass_e': float(mcfg.mass_e),
-          'mass_h': float(mcfg.mass_h),
-          'dielectric_constant': float(mcfg.dielectric_constant),
-          'interlayer_distance': float(mcfg.interlayer_distance),
-      }
+    })
+    # feature_layer_defaults.update(dict(cfg.network.make_feature_layer_kwargs))
+    cfg.network.make_feature_layer_kwargs = feature_layer_kwargs
+    
+    jastrow_choice = str(cfg.network.get('jastrow', 'default')).lower()
+    if jastrow_choice == 'default':
+      cfg.network.jastrow = 'bilayer'
+    elif jastrow_choice == 'simple_ee':
+      raise ValueError(
+          "cfg.network.jastrow='simple_ee' is incompatible with electron-hole "
+          "moire bilayers because it applies repulsive electron-electron cusp "
+          "conditions across electron-hole pairs and ignores effective masses "
+          "and dielectric screening. Use cfg.network.jastrow='bilayer' (or "
+          "'none')."
+      )
 
+    if (
+        cfg.network.get('network_type', 'ferminet') == 'psiformer'
+        and not cfg.network.full_det
+    ):
+      raise ValueError(
+          "Psiformer only supports full_det=True; set cfg.network.full_det=True "
+          "or use cfg.network.network_type='ferminet'."
+      )
     #May need to check this choice of envelope?
-    cfg.network.make_envelope_fn = '' #Empty setting defaults to using make_multiwave_envelope which was also used in heg.py, and also similar envelope in monolayer moire systems in JaQMC
-    cfg.network.make_envelope_kwargs = {}  
+    jastrow_kwargs = (
+        dict(cfg.network.jastrow_kwargs)
+        if cfg.network.get('jastrow_kwargs') is not None
+        else {}
+    )
+    jastrow_kwargs.update({
+        'mass_e': float(mcfg.mass_e),
+        'mass_h': float(mcfg.mass_h),
+        'dielectric_constant': float(mcfg.dielectric_constant),
+        'interlayer_distance': float(mcfg.interlayer_distance),
+    })
+    cfg.network.jastrow_kwargs = jastrow_kwargs
   
   return cfg
 
@@ -182,9 +232,12 @@ def get_config() -> ml_collections.ConfigDict:
   cfg.pretrain.method = None
   cfg.pretrain.iterations = 0
   cfg.mcmc.scale_by_nuclear_distance = False
+  cfg.mcmc.move_width = 2.0
   cfg.network.full_det = True 
   # cfg.network.jastrow = 'bilayer'
   cfg.network.jastrow = 'none'
+  cfg.network.make_envelope_fn = ''
+  cfg.network.make_envelope_kwargs = {}
   cfg.optim.spin_energy = 0.0 # Controls spin-contamination penalty weight
   cfg.observables.s2 = False
   cfg.observables.dipole = False
@@ -239,7 +292,7 @@ def get_config() -> ml_collections.ConfigDict:
       'nlatvec': 1, #Sets the range of real-space Ewald sum. Here we sum the 3x3 nearest periodic images of the supercell.
       'ewald_alpha': None, # Defaults to 5.0/h_min, which was also used in pyQMC and JaQMC
       'include_capacitor': True,
-      'allow_charged_capacitor': True,
+      'allow_charged_capacitor': False,
   })
 
   cfg = _configure_moire_system(cfg)

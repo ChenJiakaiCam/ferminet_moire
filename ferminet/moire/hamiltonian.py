@@ -29,7 +29,13 @@ def _coordinate_inverse_masses(
 
     e.g. For four channels, the outputs is shaped 2*(N_e_up + N_e_down + N_h_up + N_h_down) like (1/m_e, 1/m_e ,....., 1/m_h, 1/m_h....) with factor two because it's outputing one for x and y coordinates
     """
-
+    #Just some input type checks
+    geometry.layer_particle_counts(nspins)
+    ndim_int = geometry.validate_nonnegative_int(ndim, 'ndim')
+    if ndim_int <= 0:
+      raise ValueError(f'ndim must be positive, got {ndim}.')
+      
+    
     if len(nspins) == 4 and len(masses) == 2:
         masses = (masses[0], masses[0], masses[1], masses[1])
     if len(nspins) != len(masses):
@@ -41,7 +47,10 @@ def _coordinate_inverse_masses(
     for m in masses:
         if m <= 0.0:
             raise ValueError(f'Effective masses must be positive, got {masses}.')
-    counts = [int(n) * int(ndim) for n in nspins] # Number of each particle species
+    counts = [
+        geometry.validate_nonnegative_int(n, 'nspins entry') * ndim_int
+        for n in nspins
+    ] # Number of each particle species
     inv_m = [1.0 / float(m) for m in masses]
     if sum(counts) == 0:
         return np.zeros((0,), dtype=np.float64)
@@ -270,14 +279,20 @@ def make_moire_potential(
   lat_e = default_moire if moire_lattice_e is None else moire_lattice_e
   lat_h = default_moire if moire_lattice_h is None else moire_lattice_h
   
-  # i.e. to check that the simulation cell is an integer repetition of both top and bottom moire unit cells
-  geometry.validate_commensurate(lat_e, sim_lat)
-  geometry.validate_commensurate(lat_h, sim_lat)
+  
+  if v_e != 0.0:
+    geometry.validate_commensurate(lat_e, sim_lat) # i.e. to check that the simulation cell is an integer repetition of both top and bottom moire unit cells
+    gvecs_e = np.asarray(geometry.moire_harmonic_gvectors(lat_e)) #Return the three 120 degrees separated moire potential lattice vectors
+  else:
+    gvecs_e = np.zeros((3, 2), dtype=np.float64)
 
-
-  #Return the three 120 degrees separated moire potential lattice vectors
-  gvecs_e = np.asarray(geometry.moire_harmonic_gvectors(lat_e))
-  gvecs_h = np.asarray(geometry.moire_harmonic_gvectors(lat_h))
+  if v_h != 0.0:
+    geometry.validate_commensurate(lat_h, sim_lat)
+    gvecs_h = np.asarray(geometry.moire_harmonic_gvectors(lat_h))
+  else:
+    gvecs_h = np.zeros((3, 2), dtype=np.float64)
+    
+  
   offset_e_arr = np.asarray(offset_e, dtype=np.float64)
   offset_h_arr = np.asarray(offset_h, dtype=np.float64)
   if offset_e_arr.shape != (2,) or offset_h_arr.shape != (2,):
