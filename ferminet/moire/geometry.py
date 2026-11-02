@@ -317,6 +317,93 @@ def moire_harmonic_gvectors(primitive_lattice: Array) -> jnp.ndarray:
   return first_shell[0:5:2]
 
 
+def moire_harmonic_shells_from_first_shell(
+    first_shell_triad: Array,
+    num_shells: int = 1,
+) -> jnp.ndarray:
+  """Constructs ``num_shells`` C3-symmetric reciprocal vector triads from the 1st shell.
+
+  Given the first-shell C3 triad ``(g_1, g_2, g_3)`` separated by 120 degrees
+  with ``g_1 + g_2 + g_3 = 0`` (so ``g_1`` and ``-g_3`` span a 60-degree sector
+  with ``g_1 . (-g_3) = +|g_1|^2 / 2``), every non-zero reciprocal lattice
+  vector belongs to a unique ``+-C3`` triad indexed by integers
+  ``(p, q)`` with ``p >= 1, q >= 0``:
+
+    ``G_1^{(p,q)} = p g_1 - q g_3``
+    ``G_2^{(p,q)} = p g_2 - q g_1``
+    ``G_3^{(p,q)} = p g_3 - q g_2``
+
+  with squared norm ``|G^{(p,q)}|^2 = (p^2 + p q + q^2) |g_1|^2`` and exact
+  zero sum ``G_1^{(p,q)} + G_2^{(p,q)} + G_3^{(p,q)} = 0``. Ordering ``(p, q)``
+  by increasing ``(Q(p, q) = p^2 + p q + q^2, q, p)`` yields:
+    - Shell 1 (``s=0``, ``(p,q)=(1,0)``, ``|G| = G_M``): ``(g_1, g_2, g_3)``
+    - Shell 2 (``s=1``, ``(p,q)=(1,1)``, ``|G| = sqrt(3) G_M``):
+      ``(g_1 - g_3, g_2 - g_1, g_3 - g_2)``
+    - Shell 3 (``s=2``, ``(p,q)=(2,0)``, ``|G| = 2 G_M``):
+      ``(2 g_1, 2 g_2, 2 g_3)``
+    - Shell 4a/4b (``s=3,4``, ``(p,q)=(2,1),(1,2)``, ``|G| = sqrt(7) G_M``)
+    - Shell 5 (``s=5``, ``(p,q)=(3,0)``, ``|G| = 3 G_M``), etc.
+
+  Args:
+    first_shell_triad: Shape ``(3, 2)`` array containing ``(g_1, g_2, g_3)``.
+    num_shells: Number of C3-symmetric harmonic triads to return (``>= 1``).
+
+  Returns:
+    JAX array of shape ``(num_shells, 3, 2)`` containing the C3-symmetric
+    reciprocal vector triads ordered by increasing norm.
+  """
+  n_shells = validate_nonnegative_int(num_shells, 'num_shells')
+  if n_shells < 1:
+    raise ValueError(f'num_shells must be >= 1, got {num_shells}.')
+  g_triad = jnp.asarray(first_shell_triad)
+  if g_triad.shape != (3, 2):
+    raise ValueError(
+        f'first_shell_triad must have shape (3, 2), got {g_triad.shape}.'
+    )
+  g1, g2, g3 = g_triad[0], g_triad[1], g_triad[2]
+
+  max_idx = int(np.ceil(np.sqrt(float(n_shells)))) + 2
+  candidates = []
+  for p in range(1, max_idx + 1):
+    for q in range(0, max_idx + 1):
+      q_metric = p * p + p * q + q * q
+      candidates.append((q_metric, q, p))
+  candidates.sort()
+  selected = candidates[:n_shells]
+
+  shells = []
+  for _, q, p in selected:
+    pf = float(p)
+    qf = float(q)
+    shells.append(
+        jnp.stack(
+            [pf * g1 - qf * g3, pf * g2 - qf * g1, pf * g3 - qf * g2],
+            axis=0,
+        )
+    )
+  return jnp.stack(shells, axis=0)
+
+
+def moire_harmonic_shells(
+    primitive_lattice: Array,
+    num_shells: int = 1,
+) -> jnp.ndarray:
+  """Returns the first ``num_shells`` C3-symmetric moire reciprocal triads.
+
+  Args:
+    primitive_lattice: Shape ``(2, 2)`` primitive moire lattice (columns).
+    num_shells: Number of C3-symmetric harmonic shells/triads (``>= 1``).
+
+  Returns:
+    JAX array of shape ``(num_shells, 3, 2)`` where ``shells[0]`` equals
+    ``moire_harmonic_gvectors(primitive_lattice)``.
+  """
+  first_shell_triad = moire_harmonic_gvectors(primitive_lattice)
+  return moire_harmonic_shells_from_first_shell(
+      first_shell_triad, num_shells=num_shells
+  )
+
+
 def cartesian_to_fractional(
     positions: Array, #Flattened 1D array, like [x1, y1, x2, y2, ......, xn, yn] for 2D
     lattice: Array,
