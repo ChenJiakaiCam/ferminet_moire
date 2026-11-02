@@ -7,7 +7,7 @@ Also included dielectric screening.
 
 """
 
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple, Union
 
 from ferminet.moire import geometry
 import jax
@@ -54,18 +54,21 @@ def _halfspace_gpoint_indices_2d(ewald_gmax: int) -> np.ndarray:
 
 
 class BilayerEwaldSum:
-  r"""2D-periodic Ewald summation for an electron-hole bilayer.
+  r"""2D-periodic Ewald summation for a 2D carrier bilayer.
 
   Evaluates the 2D-periodic sums of the 3D Coulomb kernels screened by a
   constant relative dielectric permittivity ``epsilon_r``:
 
   .. math::
       v_{ee}(r) = v_{hh}(r) = \frac{1}{\epsilon_r r}, \qquad
-      v_{eh}(r) = -\frac{1}{\epsilon_r \sqrt{r^2 + d^2}},
+      v_{eh}(r) = \frac{q_1 q_2}{\epsilon_r \sqrt{r^2 + d^2}},
 
-  where ``r`` is the in-plane distance and ``d >= 0`` is the fixed interlayer
-  separation between the electron plane (``z_e = 0``) and the hole plane
-  (``z_h = d``).
+  where ``r`` is the in-plane distance, ``d >= 0`` is the fixed interlayer
+  separation between layer 1 (``z_e = 0``) and layer 2 (``z_h = d``), and
+  ``q_1, q_2 in {-1, +1}`` are the carrier charges in each layer (``(-1, +1)``
+  for an electron-hole bilayer, ``(-1, -1)`` for an electron-electron bilayer,
+  ``(+1, -1)`` for a hole-electron bilayer, or ``(+1, +1)`` for a hole-hole
+  bilayer).
 
   Uses Parry's 2D Ewald summation formula so that the real-space,
   reciprocal-space (``G != 0``), self-interaction, and zero-wavevector
@@ -82,8 +85,11 @@ class BilayerEwaldSum:
       ewald_gmax: int = 100,
       nlatvec: int = 1,
       alpha: Optional[float] = None,
-      include_capacitor: bool = True,
+      include_capacitor: Optional[bool] = None,
       allow_charged_capacitor: bool = False,
+      charges: Optional[Union[Sequence[geometry.CarrierSpec], str]] = None,
+      charge_e: Optional[geometry.CarrierSpec] = None,
+      charge_h: Optional[geometry.CarrierSpec] = None,
   ):
     """Initializes precomputed lattice and reciprocal-space Ewald tables.
 
@@ -109,20 +115,34 @@ class BilayerEwaldSum:
       # The two arguments below basically only decides the reference energy level of the output, they don't change the simulation result.
       # Essentially only changes the output energy values by a constant amount.
         
-      include_capacitor: If True (default), include the physical ``G = 0``
-        parallel-plate capacitor contribution ``+(2 * pi * d / (epsilon_r * A))
-        * N_e * N_h`` for separated layers. If False, subtract this constant
-        capacitor shift (corresponding to per-layer neutralizing backgrounds).
+      include_capacitor: If True (default for opposite-charge bilayers), include
+        the physical ``G = 0`` parallel-plate capacitor contribution
+        ``-(q_1 * q_2) * (2 * pi * d / (epsilon_r * A)) * N_1 * N_2`` for
+        separated layers. If False (default for same-charge bilayers), subtract
+        this constant capacitor shift (corresponding to per-layer neutralizing
+        backgrounds).
         
       allow_charged_capacitor: If False (default), raises ``ValueError`` when
-        ``n_electrons != n_holes``, ``interlayer_distance > 0``, and
-        ``include_capacitor=True``, since a net-charged periodic bilayer has an
-        ambiguous ``G = 0`` electrostatic energy unless the neutralizing
-        background convention is explicitly chosen.
+        the total mobile charge ``q_1 * N_1 + q_2 * N_2 != 0``,
+        ``interlayer_distance > 0``, and ``include_capacitor=True``, since a
+        net-charged periodic bilayer has an ambiguous ``G = 0`` electrostatic
+        energy unless the neutralizing background convention is explicitly
+        chosen.
+      charges: Optional 2-tuple ``(q_1, q_2)`` (or 4-tuple or string shorthand
+        ``'eh'``, ``'ee'``, ``'he'``, ``'hh'``) specifying the carrier charge in
+        each layer (``-1`` for electrons, ``+1`` for holes). Defaults to
+        ``(-1, +1)``.
+      charge_e: Optional carrier charge/type for layer 1 (defaults to ``-1``).
+      charge_h: Optional carrier charge/type for layer 2 (defaults to ``+1``).
         
     """
     
     self.n_electrons, self.n_holes = geometry.layer_particle_counts(nspins)
+    self.charge_e, self.charge_h = geometry.resolve_layer_charges(
+        charges, charge_e=charge_e, charge_h=charge_h
+    )
+    self.charges = (self.charge_e, self.charge_h)
+    self.interlayer_charge_sign = float(self.charge_e * self.charge_h)
     if interlayer_distance < 0.0:
       raise ValueError(
           f'interlayer_distance must be >= 0, got {interlayer_distance}.'
@@ -137,23 +157,30 @@ class BilayerEwaldSum:
     self.latvec_np = geometry.validate_lattice_2d(lattice) # Note this is the supercell lattice, not the moire unit cell lattice
     self.interlayer_distance = float(interlayer_distance)
     self.dielectric_constant = float(dielectric_constant)
-    self.include_capacitor = bool(include_capacitor)
+    if include_capacitor is None:
+      self.include_capacitor = bool(self.interlayer_charge_sign < 0.0)
+    else:
+      self.include_capacitor = bool(include_capacitor)
     self.allow_charged_capacitor = bool(allow_charged_capacitor)
     
+    net_charge = (
+        self.charge_e * self.n_electrons + self.charge_h * self.n_holes
+    )
     if (
-        self.n_electrons != self.n_holes
+        net_charge != 0
         and self.interlayer_distance > 0.0
         and self.include_capacitor
         and not self.allow_charged_capacitor
     ):
       raise ValueError(
-          f'Charge-imbalanced bilayer (n_electrons={self.n_electrons}, '
-          f'n_holes={self.n_holes}) with interlayer_distance='
-          f'{self.interlayer_distance} > 0 has an ambiguous G=0 capacitor '
-          'energy unless the neutralizing-background convention is specified. '
-          'Set include_capacitor=False for per-layer neutralizing backgrounds, '
-          'or set allow_charged_capacitor=True to explicitly evaluate the '
-          'uncompensated interlayer G=0 term.'
+          f'Charge-imbalanced bilayer (n_layer1={self.n_electrons} with '
+          f'q_1={self.charge_e}, n_layer2={self.n_holes} with '
+          f'q_2={self.charge_h}, net_charge={net_charge}) with '
+          f'interlayer_distance={self.interlayer_distance} > 0 has an '
+          'ambiguous G=0 capacitor energy unless the neutralizing-background '
+          'convention is specified. Set include_capacitor=False for per-layer '
+          'neutralizing backgrounds, or set allow_charged_capacitor=True to '
+          'explicitly evaluate the uncompensated interlayer G=0 term.'
       )
       
     self.area = float(abs(np.linalg.det(self.latvec_np)))
@@ -233,9 +260,11 @@ class BilayerEwaldSum:
     # Basically taking finite part of the gweight formula for G=0
     self.g0_coplanar_factor = -2.0 * np.sqrt(np.pi) / (self.area * self.alpha) 
     # Again taking finite part of G=0 interalyer weight formula
-    if include_capacitor:
+    s12 = self.interlayer_charge_sign
+    if self.include_capacitor:
       self.g0_interlayer_factor = float(
-          (2.0 * np.sqrt(np.pi) / self.area)
+          -s12
+          * (2.0 * np.sqrt(np.pi) / self.area)
           * (
               np.exp(-((self.alpha * d) ** 2)) / self.alpha
               + np.sqrt(np.pi) * d * scipy_special.erf(self.alpha * d)
@@ -244,7 +273,8 @@ class BilayerEwaldSum:
     else:
       # Difference is just the electrostatic energy of two uniformly charged sheets
       self.g0_interlayer_factor = float(
-          (2.0 * np.sqrt(np.pi) / self.area)
+          -s12
+          * (2.0 * np.sqrt(np.pi) / self.area)
           * (
               np.exp(-((self.alpha * d) ** 2)) / self.alpha
               - np.sqrt(np.pi) * d * scipy_special.erfc(self.alpha * d)
@@ -308,8 +338,8 @@ class BilayerEwaldSum:
       self, pos_e: jnp.ndarray, pos_h: jnp.ndarray
   ) -> jnp.ndarray:
     """
-    Computes unscreened periodic interaction energy between e and h layers.
-    pos_e, pos_h are 2D coordinates of the electrons in one layer and holes in the other layer
+    Computes unscreened periodic interaction energy between the two layers.
+    pos_e, pos_h are 2D coordinates of carriers in layer 1 and layer 2.
     """
     
     n_e = pos_e.shape[0]
@@ -318,6 +348,7 @@ class BilayerEwaldSum:
       return jnp.asarray(0.0, dtype=pos_e.dtype)
     
     dtype = pos_e.dtype
+    s12 = jnp.asarray(self.interlayer_charge_sign, dtype=dtype)
     lat_disp = self.lattice_displacements.astype(dtype)
     gpoints = self.gpoints.astype(dtype)
     gweight_d = self.gweight_interlayer.astype(dtype)
@@ -329,9 +360,9 @@ class BilayerEwaldSum:
     # r_safe = jnp.maximum(r_3d, 1e-12)
     r_3d_sq = jnp.sum(rvec**2, axis=-1) + d_sq #jnp.sum is just summing delta_x^2 + delta_y^2
     r_safe = jnp.sqrt(jnp.maximum(r_3d_sq, 1e-24))
-    v_real = -jnp.sum(jax.lax.erfc(self.alpha * r_safe) / r_safe)
+    v_real = s12 * jnp.sum(jax.lax.erfc(self.alpha * r_safe) / r_safe)
 
-    #U_recip = -2*Sum over half-space g points of (W_d(G)* Re[S_e(G)S_h(G)*])
+    #U_recip = 2*s12*Sum over half-space g points of (W_d(G)* Re[S_e(G)S_h(G)*])
     phases_e = gpoints @ pos_e.T
     phases_h = gpoints @ pos_h.T
     se_real = jnp.sum(jnp.cos(phases_e), axis=-1)
@@ -340,7 +371,7 @@ class BilayerEwaldSum:
     sh_imag = jnp.sum(jnp.sin(phases_h), axis=-1)
     #Re((se_real + i*se_imag)*(sh_real - i*sh_imag)) = se_real sH_real + se_imag sh_imag 
     re_se_sh_conj = se_real * sh_real + se_imag * sh_imag
-    v_recip = -2.0 * jnp.dot(gweight_d, re_se_sh_conj) #i.e. sum over G in half-space. Both vectors dotted are shape (n_gvectors, )
+    v_recip = 2.0 * s12 * jnp.dot(gweight_d, re_se_sh_conj) #i.e. sum over G in half-space. Both vectors dotted are shape (n_gvectors, )
     
     v_g0 = jnp.asarray(self.g0_interlayer_factor, dtype=dtype) * (n_e * n_h) #same for every pair of particles
     return v_real + v_recip + v_g0
@@ -381,14 +412,17 @@ def make_bilayer_ewald_potential(
     ewald_gmax: int = 100,
     nlatvec: int = 1,
     alpha: Optional[float] = None,
-    include_capacitor: bool = True,
+    include_capacitor: Optional[bool] = None,
     allow_charged_capacitor: bool = False,
+    charges: Optional[Union[Sequence[geometry.CarrierSpec], str]] = None,
+    charge_e: Optional[geometry.CarrierSpec] = None,
+    charge_h: Optional[geometry.CarrierSpec] = None,
 ) -> Callable[[jnp.ndarray], jnp.ndarray]:
   """Creates a callable evaluating the 2D-periodic bilayer Coulomb energy.
 
   Args:
     lattice: Shape ``(2, 2)`` simulation supercell matrix (columns are vectors).
-    nspins: Sequence ``(n_electrons, n_holes)``.
+    nspins: Sequence ``(n_electrons, n_holes)`` or 4-channel tuple.
     interlayer_distance: Out-of-plane separation ``d >= 0`` in Bohr.
     dielectric_constant: Relative dielectric constant ``epsilon_r > 0``.
     ewald_gmax: Reciprocal-space integer cutoff per direction.
@@ -396,7 +430,11 @@ def make_bilayer_ewald_potential(
     alpha: Optional override for Ewald splitting parameter.
     include_capacitor: Whether to include the ``G = 0`` capacitor term.
     allow_charged_capacitor: Whether to permit ``include_capacitor=True`` when
-      ``n_electrons != n_holes`` and ``interlayer_distance > 0``.
+      total mobile charge is non-zero and ``interlayer_distance > 0``.
+    charges: Optional 2-tuple ``(q_1, q_2)`` (or 4-tuple or string shorthand
+      ``'eh'``, ``'ee'``, ``'he'``, ``'hh'``) of per-layer carrier charges.
+    charge_e: Optional carrier charge/type for layer 1 (defaults to ``-1``).
+    charge_h: Optional carrier charge/type for layer 2 (defaults to ``+1``).
 
   Returns:
     Callable ``potential_fn(positions) -> scalar`` returning ``U_ee + U_hh + U_eh``.
@@ -411,6 +449,9 @@ def make_bilayer_ewald_potential(
       alpha=alpha,
       include_capacitor=include_capacitor,
       allow_charged_capacitor=allow_charged_capacitor,
+      charges=charges,
+      charge_e=charge_e,
+      charge_h=charge_h,
   )
   return ewald.energy
     

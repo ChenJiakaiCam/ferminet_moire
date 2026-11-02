@@ -157,8 +157,11 @@ def make_bilayer_jastrow(
     mass_h: float = 1.0,
     dielectric_constant: float = 1.0,
     interlayer_distance: float = 1.0,
+    charges: Sequence[int | float | str] | str | None = None,
+    charge_e: int | float | str | None = None,
+    charge_h: int | float | str | None = None,
 ):
-    """Creates a Jastrow factor for 2- or 4-channel electron-hole bilayers.
+    """Creates a Jastrow factor for 2- or 4-channel carrier bilayers.
     
     Pair function in J(R) is u(r) = -ca^2/(a+r) 
     where a is trainable and c is fixed by the cusp condition using masses, dielectric constant and particle flavours.
@@ -174,11 +177,13 @@ def make_bilayer_jastrow(
       - different spin/flavour in layer ``alpha``:
         ``m_alpha / (epsilon_r * (ndim - 1))`` (i.e. ``m_alpha / epsilon_r`` in
         2D),
-      - interlayer electron-hole pairs: ``0`` when ``interlayer_distance > 0``
-        (since ``-1 / sqrt(r^2 + d^2)`` has no cusp at ``r = 0``), and
-        ``-2 * m_e * m_h / ((m_e + m_h) * epsilon_r * (ndim - 1))`` when
-        ``interlayer_distance == 0``.
+      - interlayer pairs (with layer charges ``q_1, q_2 in {-1, +1}``): ``0``
+        when ``interlayer_distance > 0`` (since ``+-1 / sqrt(r^2 + d^2)`` has no
+        cusp at ``r = 0``), and
+        ``(q_1 * q_2) * 2 * m_e * m_h / ((m_e + m_h) * epsilon_r * (ndim - 1))``
+        when ``interlayer_distance == 0``.
     """
+    from ferminet.moire import geometry  # pylint: disable=g-import-not-at-top
     
     if mass_e <= 0.0 or mass_h <= 0.0:
       raise ValueError(
@@ -195,6 +200,10 @@ def make_bilayer_jastrow(
           'interlayer_distance must be >= 0, got '
           f'{interlayer_distance}.'
       )
+    q1, q2 = geometry.resolve_layer_charges(
+        charges, charge_e=charge_e, charge_h=charge_h
+    )
+    s12 = float(q1 * q2)
     
     if lattice is not None: #PBC, use periodic distance features.
       norm = make_periodic_r_ee(lattice)
@@ -218,7 +227,7 @@ def make_bilayer_jastrow(
       two_mu_eh = 2.0 * float(mass_e) * float(mass_h) / (
           float(mass_e) + float(mass_h)
       )
-      eh_cusp = -(two_mu_eh / float(dielectric_constant)) / denom_diff
+      eh_cusp = s12 * (two_mu_eh / float(dielectric_constant)) / denom_diff
       
     cusp_matrix_4 = jnp.array([
         [indis_e, dis_e, eh_cusp, eh_cusp],

@@ -1,13 +1,13 @@
-"""2D electron-hole moire bilayer configuration for FermiNet.
+"""2D carrier moire bilayer configuration for FermiNet.
 
 Represents two parallel 2D carrier layers at fixed out-of-plane heights
-``z_e = 0`` and ``z_h = d`` with no interlayer tunneling. Spinful electrons and
-holes are mapped to four FermiNet fermion channels
-``nspins = (N_e_up, N_e_down, N_h_up, N_h_down)`` (with 2-channel
-``(N_e, N_h)`` also supported) and ``full_det = False`` so each determinant
-is a product of four block determinants ``det(D_{e,up}) det(D_{e,down})
-det(D_{h,up}) det(D_{h,down})`` while the equivariant network streams capture
-all intra- and inter-layer correlations.
+``z_1 = 0`` and ``z_2 = d`` with no interlayer tunneling. Each layer contains
+a single carrier type (either electrons with charge ``-1`` or holes with charge
+``+1``), configured via ``cfg.system.moire.charges`` (default ``(-1, 1)`` for an
+electron-hole bilayer, or ``(-1, -1)`` for an electron-electron bilayer).
+Spinful carriers in the two layers are mapped to four FermiNet fermion channels
+``nspins = (N_1_up, N_1_down, N_2_up, N_2_down)`` (with 2-channel
+``(N_1, N_2)`` also supported).
 """
 
 from typing import Tuple, Union
@@ -24,6 +24,38 @@ def _format_shell_param(arr: np.ndarray) -> Union[float, Tuple[float, ...]]:
   if arr.size == 1:
     return float(arr[0])
   return tuple(float(x) for x in arr)
+
+
+def _resolve_moire_charges(
+    mcfg: ml_collections.ConfigDict,
+) -> Tuple[int, int]:
+  """Resolves per-layer carrier charges ``(charge_e, charge_h)`` in ``{-1, +1}^2``."""
+  charges_spec = mcfg.get('layer_charges', None)
+  if charges_spec is None:
+    charges_spec = mcfg.get('carrier_types', None)
+  if charges_spec is None:
+    charges_spec = mcfg.get('charges', None)
+
+  charge_e = mcfg.get('charge_e', None)
+  if charge_e is None:
+    charge_e = mcfg.get('charge_1', None)
+  charge_h = mcfg.get('charge_h', None)
+  if charge_h is None:
+    charge_h = mcfg.get('charge_2', None)
+
+  # Allow charge_e / charge_h to override the default charges=(-1, 1) when
+  # layer_charges / carrier_types were not explicitly set.
+  if (
+      (charge_e is not None or charge_h is not None)
+      and mcfg.get('layer_charges', None) is None
+      and mcfg.get('carrier_types', None) is None
+      and charges_spec == (-1, 1)
+  ):
+    charges_spec = None
+
+  return geometry.resolve_layer_charges(
+      charges_spec, charge_e=charge_e, charge_h=charge_h
+  )
 
 
 def _resolve_moire_nspins(
@@ -44,9 +76,14 @@ def _resolve_moire_nspins(
   # If false and mcfg.spins not specified, assume both electrons and holes half spin up half spin down
   spin_polarized = bool(mcfg.get('spin_polarized', False))
 
-  if mcfg.get('n_electrons') is not None:
+  n_layer1_total_spec = (
+      mcfg.get('n_layer1')
+      if mcfg.get('n_layer1') is not None
+      else mcfg.get('n_electrons')
+  )
+  if n_layer1_total_spec is not None:
     n_e_total = geometry.validate_nonnegative_int(
-        mcfg.n_electrons, 'moire.n_electrons'
+        n_layer1_total_spec, 'moire.n_electrons'
     )
     if spin_polarized:
       n_e_up, n_e_down = n_e_total, 0
@@ -54,18 +91,33 @@ def _resolve_moire_nspins(
       n_e_up = n_e_total - (n_e_total // 2)
       n_e_down = n_e_total // 2
   else:
+    n_e_up_spec = (
+        mcfg.get('n_layer1_up')
+        if mcfg.get('n_layer1_up') is not None
+        else mcfg.get('n_electrons_up', 2)
+    )
+    n_e_down_spec = (
+        mcfg.get('n_layer1_down')
+        if mcfg.get('n_layer1_down') is not None
+        else mcfg.get('n_electrons_down', 2)
+    )
     n_e_up = geometry.validate_nonnegative_int(
-        mcfg.get('n_electrons_up', 2), 'moire.n_electrons_up'
+        n_e_up_spec, 'moire.n_electrons_up'
     )
     n_e_down = geometry.validate_nonnegative_int(
-        mcfg.get('n_electrons_down', 2), 'moire.n_electrons_down'
+        n_e_down_spec, 'moire.n_electrons_down'
     )
     if spin_polarized:
       n_e_up, n_e_down = n_e_up + n_e_down, 0
 
-  if mcfg.get('n_holes') is not None:
+  n_layer2_total_spec = (
+      mcfg.get('n_layer2')
+      if mcfg.get('n_layer2') is not None
+      else mcfg.get('n_holes')
+  )
+  if n_layer2_total_spec is not None:
     n_h_total = geometry.validate_nonnegative_int(
-        mcfg.n_holes, 'moire.n_holes'
+        n_layer2_total_spec, 'moire.n_holes'
     )
     if spin_polarized:
       n_h_up, n_h_down = n_h_total, 0
@@ -73,11 +125,21 @@ def _resolve_moire_nspins(
       n_h_up = n_h_total - (n_h_total // 2)
       n_h_down = n_h_total // 2
   else:
+    n_h_up_spec = (
+        mcfg.get('n_layer2_up')
+        if mcfg.get('n_layer2_up') is not None
+        else mcfg.get('n_holes_up', 2)
+    )
+    n_h_down_spec = (
+        mcfg.get('n_layer2_down')
+        if mcfg.get('n_layer2_down') is not None
+        else mcfg.get('n_holes_down', 2)
+    )
     n_h_up = geometry.validate_nonnegative_int(
-        mcfg.get('n_holes_up', 2), 'moire.n_holes_up'
+        n_h_up_spec, 'moire.n_holes_up'
     )
     n_h_down = geometry.validate_nonnegative_int(
-        mcfg.get('n_holes_down', 2), 'moire.n_holes_down'
+        n_h_down_spec, 'moire.n_holes_down'
     )
     if spin_polarized:
       n_h_up, n_h_down = n_h_up + n_h_down, 0
@@ -92,6 +154,8 @@ def _configure_moire_system(
   mcfg = cfg.system.moire
 
   nspins = _resolve_moire_nspins(mcfg)
+  charge_e, charge_h = _resolve_moire_charges(mcfg)
+  layer_charges = (int(charge_e), int(charge_h))
   n_e, n_h = geometry.layer_particle_counts(nspins) #Total n_e and n_h from the spin counts (assuming e/h on separate layers)
   if n_e < 0 or n_h < 0 or (n_e + n_h) <= 0:
     raise ValueError(
@@ -151,6 +215,16 @@ def _configure_moire_system(
     geometry.validate_commensurate(lat_e, sim_lattice)
   if np.any(v_h_arr != 0.0):
     geometry.validate_commensurate(lat_h, sim_lattice)
+
+  allow_charged_capacitor = bool(mcfg.get('allow_charged_capacitor', False))
+  if mcfg.get('include_capacitor') is None:
+    include_capacitor = bool(charge_e * charge_h < 0)
+  elif charge_e * charge_h > 0 and not allow_charged_capacitor:
+    # Same-charge bilayers (e.g. electron-electron) require per-layer
+    # neutralizing backgrounds in 2D PBC unless allow_charged_capacitor=True.
+    include_capacitor = False
+  else:
+    include_capacitor = bool(mcfg.include_capacitor)
   
   with cfg.ignore_type(): #I think ignore_type() may not actually be necessasry?
     cfg.system.lattice = sim_lattice #Supercell lattice 
@@ -177,10 +251,11 @@ def _configure_moire_system(
         'ewald_gmax': int(mcfg.ewald_gmax),
         'nlatvec': int(mcfg.nlatvec),
         'ewald_alpha': mcfg.ewald_alpha,
-        'include_capacitor': bool(mcfg.include_capacitor),
-        'allow_charged_capacitor': bool(
-            mcfg.get('allow_charged_capacitor', False)
-        ),
+        'include_capacitor': include_capacitor,
+        'allow_charged_capacitor': allow_charged_capacitor,
+        'layer_charges': layer_charges,
+        'charge_e': int(charge_e),
+        'charge_h': int(charge_h),
     }
     local_energy_kwargs = dict(cfg.system.make_local_energy_kwargs)
     local_energy_kwargs.update(local_energy_defaults)
@@ -231,6 +306,9 @@ def _configure_moire_system(
         'mass_h': float(mcfg.mass_h),
         'dielectric_constant': float(mcfg.dielectric_constant),
         'interlayer_distance': float(mcfg.interlayer_distance),
+        'charges': layer_charges,
+        'charge_e': int(charge_e),
+        'charge_h': int(charge_h),
     })
     cfg.network.jastrow_kwargs = jastrow_kwargs
   
@@ -265,10 +343,24 @@ def get_config() -> ml_collections.ConfigDict:
   # Moire bilayer physical and numerical parameters (all lengths in Bohr and
   # energies in Hartree).
   cfg.system.moire = ml_collections.ConfigDict({
+      # Per-layer carrier charges / types (each layer is strictly either
+      # electrons with q = -1 or holes with q = +1):
+      #   - (-1, 1) or 'eh' / ('e', 'h'): layer 1 = electrons, layer 2 = holes
+      #   - (-1, -1) or 'ee' / ('e', 'e'): electrons in both layers
+      #   - (1, -1) or 'he' / ('h', 'e'): layer 1 = holes, layer 2 = electrons
+      #   - (1, 1) or 'hh' / ('h', 'h'): holes in both layers
+      'charges': (-1, 1),
+      'layer_charges': None,
+      'carrier_types': None,
+      'charge_e': None,
+      'charge_h': None,
+
       # Four fermion channels: (N_e_up, N_e_down, N_h_up, N_h_down).
       # You can set n_electrons_up / n_electrons_down / n_holes_up / n_holes_down
+      # (or layer aliases n_layer1_up / n_layer1_down / n_layer2_up / n_layer2_down)
       # directly, pass an explicit 4- or 2-tuple in 'nspins', or set total layer
-      # counts 'n_electrons' / 'n_holes' (with 'spin_polarized' = False/True).
+      # counts 'n_electrons' / 'n_holes' (or 'n_layer1' / 'n_layer2') with
+      # 'spin_polarized' = False/True.
       
       'n_electrons_up': 3, #Particle number per simulation supercell, not per moire unit cell!
       'n_electrons_down': 3,
@@ -277,6 +369,12 @@ def get_config() -> ml_collections.ConfigDict:
       'nspins': None,
       'n_electrons': None,
       'n_holes': None,
+      'n_layer1': None,
+      'n_layer2': None,
+      'n_layer1_up': None,
+      'n_layer1_down': None,
+      'n_layer2_up': None,
+      'n_layer2_down': None,
       'spin_polarized': False,
       # Effective masses m_e^* / m_0 and m_h^* / m_0.
       'mass_e': 0.70,

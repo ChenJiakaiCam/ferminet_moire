@@ -12,13 +12,14 @@ direct lattice vectors ``a_1`` and ``a_2``. Consequently, for a row vector
 """
 
 
-from typing import Sequence, Tuple, Union
+from typing import Optional, Sequence, Tuple, Union
 
 from ferminet import mcmc
 import jax.numpy as jnp
 import numpy as np
 
 Array = Union[np.ndarray, jnp.ndarray] #i.e. either numpy or JAX array
+CarrierSpec = Union[int, float, str]
 
 def validate_nonnegative_int(value: object, name: str = 'count') -> int:
   if isinstance(value, (bool, np.bool_)):
@@ -34,6 +35,148 @@ def validate_nonnegative_int(value: object, name: str = 'count') -> int:
   if int_val < 0:
     raise ValueError(f'{name} must be >= 0, got {value!r}.')
   return int_val
+
+
+def resolve_carrier_charge(value: object, name: str = 'charge') -> int:
+  """Resolves a single layer's carrier charge sign in ``{-1, +1}``.
+
+  Accepts either unit charges ``-1`` (electrons) / ``+1`` (holes) or string
+  carrier labels such as ``'e'``, ``'electron'``, ``'electrons'`` (``-> -1``)
+  and ``'h'``, ``'hole'``, ``'holes'`` (``-> +1``).
+
+  Args:
+    value: Carrier charge or label for one layer.
+    name: Parameter name used in error messages.
+
+  Returns:
+    ``-1`` for electrons or ``+1`` for holes.
+
+  Raises:
+    ValueError: If ``value`` does not represent a unit electron or hole charge.
+  """
+  if isinstance(value, (bool, np.bool_)):
+    raise ValueError(
+        f"{name} must be -1/+1 or 'e'/'h', got boolean {value!r}."
+    )
+  if isinstance(value, (int, np.integer)):
+    q = int(value)
+    if q in (-1, 1):
+      return q
+  elif isinstance(value, (float, np.floating)):
+    if np.isfinite(value) and float(value).is_integer():
+      q = int(value)
+      if q in (-1, 1):
+        return q
+  elif isinstance(value, str):
+    key = value.strip().lower()
+    if key in ('e', 'elec', 'electron', 'electrons', '-', '-1', '-1.0', '-e'):
+      return -1
+    if key in (
+        'h',
+        'hole',
+        'holes',
+        '+',
+        '+1',
+        '1',
+        '+1.0',
+        '1.0',
+        '+e',
+    ):
+      return 1
+  raise ValueError(
+      f"{name} must be -1 (electron) or +1 (hole) (or 'e'/'h'), got {value!r}."
+  )
+
+
+def resolve_layer_charges(
+    charges: Optional[Union[Sequence[object], str]] = None,
+    charge_e: Optional[object] = None,
+    charge_h: Optional[object] = None,
+) -> Tuple[int, int]:
+  """Resolves the per-layer carrier charges ``(q_1, q_2)`` in ``{-1, +1}^2``.
+
+  Each layer is restricted to a single carrier type (either electrons with
+  ``q = -1`` or holes with ``q = +1``), supporting:
+    - electron-hole bilayers: ``(-1, +1)`` (default) or ``'eh'`` / ``('e', 'h')``
+    - electron-electron bilayers: ``(-1, -1)`` or ``'ee'`` / ``('e', 'e')``
+    - hole-electron bilayers: ``(+1, -1)`` or ``'he'`` / ``('h', 'e')``
+    - hole-hole bilayers: ``(+1, +1)`` or ``'hh'`` / ``('h', 'h')``
+
+  A 4-element sequence ``(q_1_up, q_1_down, q_2_up, q_2_down)`` is also
+  accepted provided ``q_1_up == q_1_down`` and ``q_2_up == q_2_down``.
+
+  Args:
+    charges: Optional 2-tuple (or 4-tuple) of per-layer charges/labels, or a
+      shorthand string in ``{'eh', 'ee', 'he', 'hh', 'e-h', 'e-e', 'h-e', 'h-h'}``.
+    charge_e: Optional carrier charge/label for layer 1 (defaults to ``-1`` when
+      ``charges`` is None).
+    charge_h: Optional carrier charge/label for layer 2 (defaults to ``+1`` when
+      ``charges`` is None).
+
+  Returns:
+    Tuple ``(q_1, q_2)`` with ``q_1, q_2 in {-1, +1}``.
+  """
+  if charges is not None:
+    if isinstance(charges, str):
+      key = charges.strip().lower().replace('-', '').replace('_', '').replace(' ', '')
+      shorthand = {
+          'eh': (-1, 1),
+          'ee': (-1, -1),
+          'he': (1, -1),
+          'hh': (1, 1),
+      }
+      if key not in shorthand:
+        raise ValueError(
+            "String 'charges' must be one of 'eh', 'ee', 'he', 'hh' "
+            f"(or 'e-h', 'e-e', 'h-e', 'h-h'), got {charges!r}."
+        )
+      q1, q2 = shorthand[key]
+    elif isinstance(charges, (Sequence, np.ndarray)):
+      items = list(charges)
+      if len(items) == 2:
+        q1 = resolve_carrier_charge(items[0], 'charges[0]')
+        q2 = resolve_carrier_charge(items[1], 'charges[1]')
+      elif len(items) == 4:
+        q1_up = resolve_carrier_charge(items[0], 'charges[0]')
+        q1_dn = resolve_carrier_charge(items[1], 'charges[1]')
+        q2_up = resolve_carrier_charge(items[2], 'charges[2]')
+        q2_dn = resolve_carrier_charge(items[3], 'charges[3]')
+        if q1_up != q1_dn or q2_up != q2_dn:
+          raise ValueError(
+              'Each layer must contain only a single carrier type (either '
+              f'electrons or holes); got 4-channel charges {charges!r} with '
+              f'layer 1 ({q1_up}, {q1_dn}) and layer 2 ({q2_up}, {q2_dn}).'
+          )
+        q1, q2 = q1_up, q2_up
+      else:
+        raise ValueError(
+            'Expected charges to have length 2 (q_layer1, q_layer2) or '
+            f'length 4, got {charges!r}.'
+        )
+    else:
+      raise ValueError(
+          'Expected charges to be a 2-tuple of (-1, +1) or carrier type '
+          f'strings, got {charges!r}.'
+      )
+    if charge_e is not None:
+      q1_override = resolve_carrier_charge(charge_e, 'charge_e')
+      if q1_override != q1:
+        raise ValueError(
+            f'Conflicting layer 1 charge specifications: charges={charges!r} '
+            f'vs charge_e={charge_e!r}.'
+        )
+    if charge_h is not None:
+      q2_override = resolve_carrier_charge(charge_h, 'charge_h')
+      if q2_override != q2:
+        raise ValueError(
+            f'Conflicting layer 2 charge specifications: charges={charges!r} '
+            f'vs charge_h={charge_h!r}.'
+        )
+    return q1, q2
+
+  q1 = -1 if charge_e is None else resolve_carrier_charge(charge_e, 'charge_e')
+  q2 = 1 if charge_h is None else resolve_carrier_charge(charge_h, 'charge_h')
+  return q1, q2
 
 def layer_particle_counts(nspins: Sequence[int]) -> Tuple[int, int]:
   """Resolves total (n_electrons, n_holes) from 4- or 2-channel ``nspins``.

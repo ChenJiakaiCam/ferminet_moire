@@ -817,10 +817,13 @@ def local_energy(
     ewald_gmax: int = 100,
     nlatvec: int = 1,
     ewald_alpha: Optional[float] = None,
-    include_capacitor: bool = True,
+    include_capacitor: Optional[bool] = None,
     allow_charged_capacitor: bool = False,
+    layer_charges: Optional[Union[Sequence[geometry.CarrierSpec], str]] = None,
+    charge_e: Optional[geometry.CarrierSpec] = None,
+    charge_h: Optional[geometry.CarrierSpec] = None,
 ) -> hamiltonian.LocalEnergy:
-  """Creates the local energy function for a 2D electron-hole moire bilayer.
+  """Creates the local energy function for a 2D carrier moire bilayer.
 
   Matches the ``MakeLocalEnergy`` calling convention used by ``ferminet.train``.
 
@@ -861,7 +864,12 @@ def local_energy(
     ewald_alpha: Optional explicit Ewald splitting parameter.
     include_capacitor: Whether to include the ``G = 0`` capacitor term.
     allow_charged_capacitor: Whether to permit ``include_capacitor=True`` when
-      ``n_electrons != n_holes`` and ``interlayer_distance > 0``.
+      total mobile charge is non-zero and ``interlayer_distance > 0``.
+    layer_charges: Optional 2-tuple ``(q_1, q_2)`` (or 4-tuple or string
+      shorthand ``'eh'``, ``'ee'``, ``'he'``, ``'hh'``) of per-layer carrier
+      charges (``-1`` for electrons, ``+1`` for holes). Defaults to ``(-1, +1)``.
+    charge_e: Optional carrier charge/type for layer 1 (defaults to ``-1``).
+    charge_h: Optional carrier charge/type for layer 2 (defaults to ``+1``).
 
   Returns:
     Callable ``_e_l(params, key, data) -> (total_energy, None)``.
@@ -921,6 +929,9 @@ def local_energy(
       alpha=ewald_alpha,
       include_capacitor=include_capacitor,
       allow_charged_capacitor=allow_charged_capacitor,
+      charges=layer_charges,
+      charge_e=charge_e,
+      charge_h=charge_h,
   )
 
   def _e_l(
