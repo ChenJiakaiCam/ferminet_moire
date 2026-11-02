@@ -10,12 +10,20 @@ det(D_{h,up}) det(D_{h,down})`` while the equivariant network streams capture
 all intra- and inter-layer correlations.
 """
 
-from typing import Tuple
+from typing import Tuple, Union
 from ferminet import base_config
 from ferminet.moire import geometry
+from ferminet.moire import hamiltonian as moire_hamiltonian
 from ferminet.utils import system
 import ml_collections
 import numpy as np
+
+
+def _format_shell_param(arr: np.ndarray) -> Union[float, Tuple[float, ...]]:
+  """Formats a 1D shell parameter array as a float (1 shell) or tuple."""
+  if arr.size == 1:
+    return float(arr[0])
+  return tuple(float(x) for x in arr)
 
 
 def _resolve_moire_nspins(
@@ -129,10 +137,17 @@ def _configure_moire_system(
       )
   )
   
+  v_e_arr, phi_e_arr = moire_hamiltonian.resolve_moire_potential_params(
+      mcfg.v_e, mcfg.phi_e
+  )
+  v_h_arr, phi_h_arr = moire_hamiltonian.resolve_moire_potential_params(
+      mcfg.v_h, mcfg.phi_h
+  )
+
   # Both moire potentials must be commensurate with the simulation supercell.
-  if float(mcfg.v_e) != 0.0:
+  if np.any(v_e_arr != 0.0):
     geometry.validate_commensurate(lat_e, sim_lattice)
-  if float(mcfg.v_h) != 0.0:
+  if np.any(v_h_arr != 0.0):
     geometry.validate_commensurate(lat_h, sim_lattice)
   
   with cfg.ignore_type(): #I think ignore_type() may not actually be necessasry?
@@ -149,10 +164,10 @@ def _configure_moire_system(
         'mass_h': float(mcfg.mass_h),
         'interlayer_distance': float(mcfg.interlayer_distance),
         'dielectric_constant': float(mcfg.dielectric_constant),
-        'v_e': float(mcfg.v_e),
-        'v_h': float(mcfg.v_h),
-        'phi_e': float(mcfg.phi_e),
-        'phi_h': float(mcfg.phi_h),
+        'v_e': _format_shell_param(v_e_arr),
+        'v_h': _format_shell_param(v_h_arr),
+        'phi_e': _format_shell_param(phi_e_arr),
+        'phi_h': _format_shell_param(phi_h_arr),
         'offset_e': tuple(float(x) for x in mcfg.offset_e),
         'offset_h': tuple(float(x) for x in mcfg.offset_h),
         'ewald_gmax': int(mcfg.ewald_gmax),
@@ -277,7 +292,10 @@ def get_config() -> ml_collections.ConfigDict:
       
       
       # Separate electron and hole moire potential parameters:
-      # V_alpha(r) = 2 * v_alpha * sum_{m=1}^3 cos(g_m . (r - offset_alpha) + phi_alpha)
+      # V_alpha(r) = 2 * sum_{s=1}^{N_shells} v_{alpha,s}
+      #              * sum_{m=1}^3 cos(G_m^{(s)} . (r - offset_alpha) + phi_{alpha,s})
+      # 'v_e'/'v_h' and 'phi_e'/'phi_h' can be scalars (1-shell) or tuples of
+      # length N_shells (multi-shell).
       'v_e': 0.0,
       'v_h': -5.512e-4,
       'phi_e': 0.0,
@@ -293,7 +311,7 @@ def get_config() -> ml_collections.ConfigDict:
       'ewald_alpha': None, # Defaults to 5.0/h_min, which was also used in pyQMC and JaQMC
       'include_capacitor': True,
       'allow_charged_capacitor': False,
-  })
+  }, type_safe=False)
 
   cfg = _configure_moire_system(cfg)
   with cfg.ignore_type():
