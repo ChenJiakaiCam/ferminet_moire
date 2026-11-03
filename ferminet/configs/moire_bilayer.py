@@ -186,12 +186,18 @@ def _configure_moire_system(
       cfg.network.make_feature_layer_fn = (
           'ferminet.pbc.feature_layer.make_pbc_feature_layer'
       )
+    distance_scale = (
+        float(mcfg.lattice_constant)
+        if mcfg.primitive_lattice is None
+        else float(np.linalg.norm(prim_lattice[:, 0]))
+    )
     feature_layer_kwargs = dict(cfg.network.make_feature_layer_kwargs)
     feature_layer_kwargs.setdefault('include_r_ae', False) #r_ae (atom-electron) gives the network a scalar atom-electron distance i.e. a cusp, which we don't want here
     feature_layer_kwargs.update({
         'lattice': sim_lattice,
         # 'include_r_ae': False, #r_ae (atom-electron) gives the network a scalar atom-electron distance i.e. a cusp, which we don't want here
         'interlayer_distance': float(mcfg.interlayer_distance),
+        'distance_scale': distance_scale,
     })
     # feature_layer_defaults.update(dict(cfg.network.make_feature_layer_kwargs))
     cfg.network.make_feature_layer_kwargs = feature_layer_kwargs
