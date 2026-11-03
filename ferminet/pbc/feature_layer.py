@@ -19,6 +19,7 @@ Spencer, J.S. and Foulkes, W.M.C., 2022. Discovering Quantum Phase Transitions
 with Fermionic Neural Networks. arXiv preprint arXiv:2202.05183.
 """
 
+import math
 from typing import Any, Optional, Sequence, Tuple
 
 import chex
@@ -56,6 +57,7 @@ def make_pbc_feature_layer(
     lattice: Optional[jnp.ndarray] = None,
     include_r_ae: bool = True,
     interlayer_distance: float = 0.0,
+    distance_scale: float = 1.0,
     **kwargs: Any,
 ) -> networks.FeatureLayer:
   """Returns the init and apply functions for periodic features.
@@ -77,6 +79,9 @@ def make_pbc_feature_layer(
         When positive and ``nspins`` has length 2 or 4, interlayer electron-hole
         pair distance features use the 3D distance
         ``sqrt(r_periodic^2 + d^2)``.
+      distance_scale: Characteristic length scale (e.g. moire lattice constant
+        ``a_M``) by which periodic distance features ``r_ae`` and ``r_ee`` are
+        divided so that network distance inputs are dimensionless O(1).
       **kwargs: Unused additional keyword arguments.
   """
 
@@ -84,13 +89,21 @@ def make_pbc_feature_layer(
 
   if lattice is None:
     lattice = jnp.eye(ndim)
+  
+  distance_scale = float(distance_scale)
+  if not math.isfinite(distance_scale) or distance_scale <= 0.0:
+    raise ValueError(
+        f'distance_scale must be finite and positive, got {distance_scale}.'
+    )
 
   # Calculate reciprocal vectors, factor 2pi omitted
   reciprocal_vecs = jnp.linalg.inv(lattice)
-  lattice_metric = lattice.T @ lattice
+  scaled_lattice = lattice / distance_scale
+  lattice_metric = scaled_lattice.T @ scaled_lattice
   
-  # z_sq is just a n_total*n_total matrix that is d**2 between all pairs of particles 
-  # that are on different layers, and 0 between pairs of particles on the same layer
+  # z_sq is just a n_total*n_total matrix that is (d / distance_scale)**2
+  # between all pairs of particles that are on different layers, and 0 between
+  # pairs of particles on the same layer
   z_sq = None
   if interlayer_distance > 0.0 and nspins is not None:
     if len(nspins) == 4:
@@ -103,7 +116,8 @@ def make_pbc_feature_layer(
           f'len(nspins) in (2, 4), got nspins={nspins}.'
       )
     n_total = sum(int(x) for x in nspins)
-    z = float(interlayer_distance) * jnp.ones((n_total, n_total))
+    scaled_d = float(interlayer_distance) / distance_scale
+    z = scaled_d * jnp.ones((n_total, n_total))
     z = z.at[:n_lower, :n_lower].set(0.0)
     z = z.at[n_lower:, n_lower:].set(0.0)
     z_sq = z**2
