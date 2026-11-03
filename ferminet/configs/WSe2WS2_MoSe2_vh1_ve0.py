@@ -9,6 +9,7 @@ is a product of four block determinants ``det(D_{e,up}) det(D_{e,down})
 det(D_{h,up}) det(D_{h,down})`` while the equivariant network streams capture
 all intra- and inter-layer correlations.
 """
+# pyright: reportAttributeAccessIssue=false, reportOptionalMemberAccess=false
 
 from typing import Tuple
 from ferminet import base_config
@@ -231,6 +232,9 @@ def get_config() -> ml_collections.ConfigDict:
   cfg.system.ndim = 2
   cfg.pretrain.method = None
   cfg.pretrain.iterations = 0
+  cfg.mcmc.init_width = 500.0
+  cfg.mcmc.burn_in = 1000
+  cfg.mcmc.steps = 30
   cfg.mcmc.scale_by_nuclear_distance = False
   cfg.mcmc.move_width = 2.0
   cfg.network.full_det = True 
@@ -238,6 +242,7 @@ def get_config() -> ml_collections.ConfigDict:
   cfg.network.jastrow = 'none'
   cfg.network.make_envelope_fn = ''
   cfg.network.make_envelope_kwargs = {}
+  cfg.optim.laplacian = 'folx'
   cfg.optim.spin_energy = 0.0 # Controls spin-contamination penalty weight
   cfg.observables.s2 = False
   cfg.observables.dipole = False
@@ -251,10 +256,14 @@ def get_config() -> ml_collections.ConfigDict:
       # directly, pass an explicit 4- or 2-tuple in 'nspins', or set total layer
       # counts 'n_electrons' / 'n_holes' (with 'spin_polarized' = False/True).
       
-      'n_electrons_up': 3, #Particle number per simulation supercell, not per moire unit cell!
-      'n_electrons_down': 3,
-      'n_holes_up': 3,
-      'n_holes_down': 3,
+      ############################################################################################################
+      'n_electrons_up': 0, #Particle number per simulation supercell, not per moire unit cell!
+      'n_electrons_down': 0,
+      'n_holes_up': 9,
+      'n_holes_down': 9,
+      'supercell_matrix': ((6, 0), (0, 3)),
+      ############################################################################################################
+      
       'nspins': None,
       'n_electrons': None,
       'n_holes': None,
@@ -262,15 +271,12 @@ def get_config() -> ml_collections.ConfigDict:
       # Effective masses m_e^* / m_0 and m_h^* / m_0.
       'mass_e': 0.70,
       'mass_h': 0.45,
-      
-      
       # Out-of-plane separation d between electron (z=0) and hole (z=d) layers.
       'interlayer_distance': 37.79,
       # Primitive moire lattice constant a_M (Bohr) and optional explicit (2, 2)
       # column-vector lattice matrices.
       'lattice_constant': 151.18,
       'primitive_lattice': None, # So triangular lattice with lattice_constant automatically set up
-      'supercell_matrix': ((6, 0), (0, 3)),
       'supercell_lattice': None, # So 2x2 moire unit cells in a supercell
       'moire_lattice_e': None, # So both potentials use the moire primitive triangular lattice, not the larger supercell lattice!
       'moire_lattice_h': None,
@@ -292,7 +298,7 @@ def get_config() -> ml_collections.ConfigDict:
       'nlatvec': 1, #Sets the range of real-space Ewald sum. Here we sum the 3x3 nearest periodic images of the supercell.
       'ewald_alpha': None, # Defaults to 5.0/h_min, which was also used in pyQMC and JaQMC
       'include_capacitor': True,
-      'allow_charged_capacitor': False,
+      'allow_charged_capacitor': True,
   })
 
   cfg = _configure_moire_system(cfg)

@@ -1,6 +1,6 @@
 """Hamiltonian for 2D electron-hole moire bilayer systems."""
 
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple, Union
 
 import chex
 from ferminet import hamiltonian
@@ -13,6 +13,48 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 import numpy as np
+
+ScalarOrSequence = Union[float, Sequence[float], geometry.Array]
+
+def resolve_moire_potential_params(
+    amplitude: ScalarOrSequence = 0.0,
+    phase: ScalarOrSequence = 0.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+  """Normalizes scalar or multi-shell sequence moire potential parameters.
+
+  Args:
+    amplitude: Scalar float or 1D sequence of shell amplitudes ``V_{alpha,s}``
+      in Hartree.
+    phase: Scalar float or 1D sequence of shell phases ``phi_{alpha,s}`` in
+      radians.
+
+  Returns:
+    Tuple ``(v_shells, phi_shells)`` of 1D ``np.float64`` arrays of matching
+    length ``num_shells >= 1``.
+  """
+  v_arr = np.atleast_1d(np.asarray(amplitude, dtype=np.float64))
+  phi_arr = np.atleast_1d(np.asarray(phase, dtype=np.float64))
+  if v_arr.ndim != 1 or v_arr.size < 1:
+    raise ValueError(
+        f'Moire amplitude must be a scalar or non-empty 1D sequence, got shape '
+        f'{v_arr.shape}.'
+    )
+  if phi_arr.ndim != 1 or phi_arr.size < 1:
+    raise ValueError(
+        f'Moire phase must be a scalar or non-empty 1D sequence, got shape '
+        f'{phi_arr.shape}.'
+    )
+  if not (np.all(np.isfinite(v_arr)) and np.all(np.isfinite(phi_arr))):
+    raise ValueError('Moire amplitude and phase entries must be finite.')
+
+  if phi_arr.size == 1 and v_arr.size > 1:
+    phi_arr = np.broadcast_to(phi_arr, v_arr.shape).copy()
+  elif v_arr.size != phi_arr.size:
+    raise ValueError(
+        f'Moire amplitude and phase must have the same number of shells, got '
+        f'len(amplitude)={v_arr.size} and len(phase)={phi_arr.size}.'
+    )
+  return v_arr, phi_arr
 
 def _coordinate_inverse_masses(
     nspins: Sequence[int], #Number of each species, vector of length 2 or 4.
@@ -63,7 +105,7 @@ def local_kinetic_energy(
     ndim: int = 2,
     use_scan: bool = False,
     complex_output: bool = False,
-    laplacian_method: str = 'default',
+    laplacian_method: str = 'folx',
 ) -> hamiltonian.KineticEnergy:
   r"""Creates a function for the mass-weighted local kinetic energy.
 
@@ -194,11 +236,11 @@ def local_kinetic_energy(
 def single_species_moire_potential(
     coords: jnp.ndarray,
     harmonic_gvectors: geometry.Array,
-    amplitude: float,
-    phase: float = 0.0,
+    amplitude: ScalarOrSequence,
+    phase: ScalarOrSequence = 0.0,
     offset: Sequence[float] | geometry.Array = (0.0, 0.0),
 ) -> jnp.ndarray:
-  r"""Evaluates the three-harmonic moire potential for one carrier layer.
+  r"""Evaluates the single- or multi-shell moire potential for one carrier layer.
 
   V(r) = 2V_a sum(m from 1 to 3) cos(g_m . (r-r_0_a) + phi_a)
 
@@ -207,30 +249,89 @@ def single_species_moire_potential(
   a = e or h
   r_0_a (offset) shifts the whole potential pattern in real space
   phi_a is a common phase 
+  
+  Can also be generalized to multi-shell potentials.
 
   Args:
     coords: Particle coordinates in the layer, shape ``(n_particles, 2)``.
-    harmonic_gvectors: Shape ``(3, 2)`` array of C3 harmonic reciprocal vectors.
-    amplitude: Potential amplitude ``V_alpha`` in Hartree (signed).
-    phase: Phase parameter ``phi_alpha`` in radians.
+    harmonic_gvectors: Shape ``(3, 2)`` (single shell) or
+      ``(num_shells, 3, 2)`` (multi-shell) array of C3 harmonic reciprocal
+      vectors. If ``amplitude`` has multiple shells and ``harmonic_gvectors``
+      has shape ``(3, 2)``, higher shells are constructed automatically from
+      the first-shell triad via ``geometry.moire_harmonic_shells_from_first_shell``.
+    amplitude: Scalar float or 1D sequence/array ``(V_{alpha,1}, ..., V_{alpha,S})``
+      of shell amplitudes in Hartree (signed).
+    phase: Scalar float or 1D sequence/array ``(phi_{alpha,1}, ..., phi_{alpha,S})``
+      of shell phases in radians.
     offset: Spatial shift ``r_{0,alpha}`` in Cartesian Bohr coordinates.
 
   Returns:
     Scalar JAX array (i.e. just a single number) giving ``sum_i V_alpha(r_i)``.
   """
   
-  if coords.shape[0] == 0 or amplitude == 0.0:
+  if coords.shape[0] == 0:
     return jnp.asarray(0.0, dtype=coords.dtype)
   dtype = coords.dtype
+  v_arr = jnp.atleast_1d(jnp.asarray(amplitude, dtype=dtype))
+  phi_arr = jnp.atleast_1d(jnp.asarray(phase, dtype=dtype))
+  if v_arr.ndim != 1 or phi_arr.ndim != 1:
+    raise ValueError(
+        'amplitude and phase in single_species_moire_potential must be '
+        f'scalars or 1D sequences, got shapes {v_arr.shape} and {phi_arr.shape}.'
+    )
+  num_shells = int(v_arr.shape[0])
+  if phi_arr.shape[0] == 1 and num_shells > 1:
+    phi_arr = jnp.broadcast_to(phi_arr, (num_shells,))
+  elif phi_arr.shape[0] != num_shells:
+    raise ValueError(
+        f'amplitude and phase must have the same number of shells, got '
+        f'{num_shells} and {phi_arr.shape[0]}.'
+    )
+
+  if not isinstance(amplitude, jax.Array):
+    if np.all(np.asarray(amplitude, dtype=np.float64) == 0.0):
+      return jnp.asarray(0.0, dtype=dtype)
+  
   gvecs = jnp.asarray(harmonic_gvectors, dtype=dtype)
+  if gvecs.ndim == 2:
+    if gvecs.shape != (3, 2):
+      raise ValueError(
+          f'2D harmonic_gvectors must have shape (3, 2), got {gvecs.shape}.'
+      )
+    if num_shells == 1:
+      gvecs = gvecs[None, :, :]  # (1, 3, 2)
+    else:
+      gvecs = jnp.asarray(
+          geometry.moire_harmonic_shells_from_first_shell(
+              gvecs, num_shells=num_shells
+          ),
+          dtype=dtype,
+      )
+  elif gvecs.ndim == 3:
+    if gvecs.shape[1:] != (3, 2):
+      raise ValueError(
+          '3D harmonic_gvectors must have shape (num_shells, 3, 2), got '
+          f'{gvecs.shape}.'
+      )
+    if gvecs.shape[0] < num_shells:
+      raise ValueError(
+          f'harmonic_gvectors has {gvecs.shape[0]} shells, fewer than '
+          f'len(amplitude)={num_shells}.'
+      )
+    gvecs = gvecs[:num_shells]
+  else:
+    raise ValueError(
+        'harmonic_gvectors must have shape (3, 2) or (num_shells, 3, 2), got '
+        f'{gvecs.shape}.'
+    )
   r0 = jnp.asarray(offset, dtype=dtype)
-  shifted = coords - r0[None, :]
-  projections = shifted @ gvecs.T  # (n_particles, 3)
-  return (
-      2.0
-      * jnp.asarray(amplitude, dtype=dtype)
-      * jnp.sum(jnp.cos(projections + jnp.asarray(phase, dtype=dtype)))
-  )
+  shifted = coords - r0[None, :]  # (n_particles, 2)
+  # projections[i, s, m] = (r_i - r_0) . G_m^{(s)}, shape (n_particles, num_shells, 3)
+  projections = jnp.einsum('id,smd->ism', shifted, gvecs)
+  shell_cos_sum = jnp.sum(
+      jnp.cos(projections + phi_arr[None, :, None]), axis=(0, 2)
+  )  # (num_shells,)
+  return 2.0 * jnp.sum(v_arr * shell_cos_sum)
   
   
 def make_moire_potential(
@@ -239,12 +340,12 @@ def make_moire_potential(
     moire_lattice: Optional[geometry.Array] = None,
     moire_lattice_e: Optional[geometry.Array] = None,
     moire_lattice_h: Optional[geometry.Array] = None,
-    v_e: float = 0.0,
-    v_h: float = 0.0,
-    phi_e: float = 0.0,
-    phi_h: float = 0.0,
-    offset_e: Sequence[float] = (0.0, 0.0),
-    offset_h: Sequence[float] = (0.0, 0.0),
+    v_e: ScalarOrSequence = 0.0,
+    v_h: ScalarOrSequence = 0.0,
+    phi_e: ScalarOrSequence = 0.0,
+    phi_h: ScalarOrSequence = 0.0,
+    offset_e: Sequence[float] | geometry.Array = (0.0, 0.0),
+    offset_h: Sequence[float] | geometry.Array = (0.0, 0.0),
 ) -> Callable[[jnp.ndarray], jnp.ndarray]:
   """Builds a callable evaluating the electron + hole moire potential energy.
 
@@ -280,17 +381,26 @@ def make_moire_potential(
   lat_h = default_moire if moire_lattice_h is None else moire_lattice_h
   
   
-  if v_e != 0.0:
-    geometry.validate_commensurate(lat_e, sim_lat) # i.e. to check that the simulation cell is an integer repetition of both top and bottom moire unit cells
-    gvecs_e = np.asarray(geometry.moire_harmonic_gvectors(lat_e)) #Return the three 120 degrees separated moire potential lattice vectors
-  else:
-    gvecs_e = np.zeros((3, 2), dtype=np.float64)
+  v_e_arr, phi_e_arr = resolve_moire_potential_params(v_e, phi_e)
+  v_h_arr, phi_h_arr = resolve_moire_potential_params(v_h, phi_h)
 
-  if v_h != 0.0:
-    geometry.validate_commensurate(lat_h, sim_lat)
-    gvecs_h = np.asarray(geometry.moire_harmonic_gvectors(lat_h))
+  if np.any(v_e_arr != 0.0):
+    geometry.validate_commensurate(lat_e, sim_lat)
+    gvecs_e = np.asarray(
+        geometry.moire_harmonic_shells(lat_e, num_shells=len(v_e_arr)),
+        dtype=np.float64,
+    )
   else:
-    gvecs_h = np.zeros((3, 2), dtype=np.float64)
+    gvecs_e = np.zeros((len(v_e_arr), 3, 2), dtype=np.float64)
+
+  if np.any(v_h_arr != 0.0):
+    geometry.validate_commensurate(lat_h, sim_lat)
+    gvecs_h = np.asarray(
+        geometry.moire_harmonic_shells(lat_h, num_shells=len(v_h_arr)),
+        dtype=np.float64,
+    )
+  else:
+    gvecs_h = np.zeros((len(v_h_arr), 3, 2), dtype=np.float64)
     
   
   offset_e_arr = np.asarray(offset_e, dtype=np.float64)
@@ -307,10 +417,18 @@ def make_moire_potential(
     pos_e = coords[:n_e]
     pos_h = coords[n_e:]
     pot_e = single_species_moire_potential(
-        pos_e, gvecs_e, amplitude=v_e, phase=phi_e, offset=offset_e_arr
+        pos_e,
+        gvecs_e,
+        amplitude=v_e_arr,
+        phase=phi_e_arr,
+        offset=offset_e_arr,
     )
     pot_h = single_species_moire_potential(
-        pos_h, gvecs_h, amplitude=v_h, phase=phi_h, offset=offset_h_arr
+        pos_h,
+        gvecs_h,
+        amplitude=v_h_arr,
+        phase=phi_h_arr,
+        offset=offset_h_arr,
     )
     return pot_e + pot_h
 
@@ -325,7 +443,7 @@ def local_energy(
     use_scan: bool = False,
     ndim: int = 2,
     complex_output: bool = False,
-    laplacian_method: str = 'default',
+    laplacian_method: str = 'folx',
     states: int = 0,
     state_specific: bool = False,
     pp_type: str = 'ccecp',
@@ -339,12 +457,12 @@ def local_energy(
     mass_h: float = 1.0,
     interlayer_distance: float = 0.0,
     dielectric_constant: float = 1.0,
-    v_e: float = 0.0,
-    v_h: float = 0.0,
-    phi_e: float = 0.0,
-    phi_h: float = 0.0,
-    offset_e: Sequence[float] = (0.0, 0.0),
-    offset_h: Sequence[float] = (0.0, 0.0),
+    v_e: ScalarOrSequence = 0.0,
+    v_h: ScalarOrSequence = 0.0,
+    phi_e: ScalarOrSequence = 0.0,
+    phi_h: ScalarOrSequence = 0.0,
+    offset_e: Sequence[float] | geometry.Array = (0.0, 0.0),
+    offset_h: Sequence[float] | geometry.Array = (0.0, 0.0),
     ewald_gmax: int = 100,
     nlatvec: int = 1,
     ewald_alpha: Optional[float] = None,
