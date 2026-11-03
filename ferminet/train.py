@@ -14,6 +14,7 @@
 
 """Core training loop for neural QMC in JAX."""
 
+import contextlib
 import functools
 import importlib
 import os
@@ -674,7 +675,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
      opt_state_ckpt,
      mcmc_width_ckpt,
      density_state_ckpt) = checkpoint.restore(
-         ckpt_restore_filename, host_batch_size)
+         ckpt_restore_filename, cfg.batch_size)
   else:
     logging.info('No checkpoint found. Training new model.')
     key, subkey = jax.random.split(key)
@@ -718,11 +719,13 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     opt_state_ckpt = None
     mcmc_width_ckpt = None
     density_state_ckpt = None
+    
+  is_host_zero = jax.process_index() == 0
 
   # Set up logging and observables
   train_schema = ['step', 'energy', 'ewmean', 'ewvar', 'pmove']
 
-  if cfg.system.states:
+  if cfg.system.states and is_host_zero:
     energy_matrix_file = open(
         os.path.join(ckpt_save_path, 'energy_matrix.npy'), 'ab')
 
@@ -735,7 +738,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         states=cfg.system.states)
     observable_states['s2'] = None
     train_schema += ['s2']
-    if cfg.system.states:
+    if cfg.system.states and is_host_zero:
       s2_matrix_file = open(
           os.path.join(ckpt_save_path, 's2_matrix.npy'), 'ab')
   if cfg.observables.dipole:
@@ -744,7 +747,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         states=cfg.system.states)
     observable_states['dipole'] = None
     train_schema += ['mu_x', 'mu_y', 'mu_z']
-    if cfg.system.states:
+    if cfg.system.states and is_host_zero:
       dipole_matrix_file = open(
           os.path.join(ckpt_save_path, 'dipole_matrix.npy'), 'ab')
   # Do this *before* creating density matrix function, as that is a special case
@@ -757,8 +760,9 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
          signed_network, data.positions, cfg, density_state_ckpt)
     # Because the density matrix can be quite large, even without excited
     # states, we always save it directly to .npy file instead of writing to CSV
-    density_matrix_file = open(
-        os.path.join(ckpt_save_path, 'density_matrix.npy'), 'ab')
+    if is_host_zero:
+      density_matrix_file = open(
+          os.path.join(ckpt_save_path, 'density_matrix.npy'), 'ab')
     # custom pmaping just for density matrix function
     pmap_density_axes = observables.DensityState(t=None,
                                                  positions=0,
@@ -766,9 +770,12 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
                                                  move_width=0,
                                                  pmove=None,
                                                  mo_coeff=None)
-    pmap_fn = constants.pmap(observable_fns['density'],
+    density_estimator = observable_fns['density']
+    def _mean_density(params, data, state):
+      return constants.pmean(density_estimator(params, data, state))
+    pmap_fn = constants.pmap(_mean_density,
                              in_axes=(0, 0, pmap_density_axes))
-    observable_fns['density'] = lambda *a, **kw: pmap_fn(*a, **kw).mean(0)
+    observable_fns['density'] = lambda *a, **kw: pmap_fn(*a, **kw)[0]
 
   # Initialisation done. We now want to have different PRNG streams on each
   # device. Shard the key over devices
@@ -1047,12 +1054,15 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         params['state_scale'] = -state_scale
 
   if writer_manager is None:
-    writer_manager = writers.Writer(
-        name='train_stats',
-        schema=train_schema,
-        directory=ckpt_save_path,
-        iteration_key=None,
-        log=False)
+    if is_host_zero:
+      writer_manager = writers.Writer(
+          name='train_stats',
+          schema=train_schema,
+          directory=ckpt_save_path,
+          iteration_key=None,
+          log=False)
+    else:
+      writer_manager = contextlib.nullcontext()
   with writer_manager as writer:
     # Main training loop
     num_resets = 0  # used if reset_if_nan is true
@@ -1104,7 +1114,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
             raise e
 
       # Logging
-      if t % cfg.log.stats_frequency == 0:
+      if t % cfg.log.stats_frequency == 0 and is_host_zero:
         logging_str = ('Step %05d: '
                        '%03.4f E_h, exp. variance=%03.4f E_h^2, pmove=%0.2f')
         logging_args = t, loss, weighted_stats.variance, pmove
@@ -1130,32 +1140,75 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
             logging_str += ', <S^2>=%03.4f'
             logging_args += obs_data,
         logging.info(logging_str, *logging_args)
-        writer.write(t, **writer_kwargs)
+        writer.write(t, **writer_kwargs)  # pyrefly: ignore[missing-attribute]
 
       # Log data about observables too big to fit in a CSV
       if cfg.system.states:
         energy_matrix = aux_data.local_energy_mat
         energy_matrix = np.nanmean(np.nanmean(energy_matrix, axis=0), axis=0)  # pyrefly: ignore[no-matching-overload]
-        np.save(energy_matrix_file, energy_matrix)  # pyrefly: ignore[unbound-name]
-        if cfg.observables.s2:
-          np.save(s2_matrix_file, observable_data['s2'])  # pyrefly: ignore[unbound-name]
-        if cfg.observables.dipole:
-          np.save(dipole_matrix_file, observable_data['dipole'])  # pyrefly: ignore[unbound-name]
-      if cfg.observables.density:
+        energy_matrix = np.mean(
+            multihost_utils.process_allgather(
+                np.asarray(energy_matrix), tiled=False
+            ),
+            axis=0,
+        )
+        if is_host_zero:
+          np.save(energy_matrix_file, energy_matrix)  # pyrefly: ignore[unbound-name]
+          if cfg.observables.s2:
+            np.save(s2_matrix_file, observable_data['s2'])  # pyrefly: ignore[unbound-name]
+          if cfg.observables.dipole:
+            np.save(dipole_matrix_file, observable_data['dipole'])  # pyrefly: ignore[unbound-name]
+      if cfg.observables.density and is_host_zero:
         np.save(density_matrix_file, observable_data['density'])  # pyrefly: ignore[unbound-name]
 
-      # Checkpointing
-      if time.time() - time_of_last_ckpt > cfg.log.save_frequency * 60:
-        writer.flush()
-        checkpoint.save(ckpt_save_path, t, data, params, opt_state, mcmc_width)
+      # Checkpointing (synchronized decision across all hosts)
+      should_save = bool(
+          multihost_utils.broadcast_one_to_all(
+              jnp.asarray(
+                  time.time() - time_of_last_ckpt > cfg.log.save_frequency * 60
+              )
+          )
+      )
+      if should_save:
+        host_data = jax.tree_util.tree_map(np.asarray, data)
+        gathered_data = multihost_utils.process_allgather(host_data, tiled=True)
+        gathered_density_state = None
+        if (
+            cfg.observables.density
+            and observable_states.get('density') is not None
+        ):
+          ds = observable_states['density']
+          gathered_density_state = observables.DensityState(
+              t=ds.t,
+              positions=multihost_utils.process_allgather(
+                  np.asarray(ds.positions), tiled=True
+              ),
+              probabilities=multihost_utils.process_allgather(
+                  np.asarray(ds.probabilities), tiled=True
+              ),
+              move_width=np.asarray(ds.move_width),
+              pmove=np.asarray(ds.pmove),
+              mo_coeff=np.asarray(ds.mo_coeff),
+          )
+        if is_host_zero:
+          writer.flush()  # pyrefly: ignore[missing-attribute]
+          checkpoint.save(
+              ckpt_save_path,
+              t,
+              gathered_data,
+              params,
+              opt_state,
+              mcmc_width,
+              density_state=gathered_density_state,
+          )
         time_of_last_ckpt = time.time()
 
     # Shut down logging at end
-    if cfg.system.states:
+    if cfg.system.states and is_host_zero:
       energy_matrix_file.close()  # pyrefly: ignore[unbound-name]
       if cfg.observables.s2:
         s2_matrix_file.close()  # pyrefly: ignore[unbound-name]
       if cfg.observables.dipole:
         dipole_matrix_file.close()  # pyrefly: ignore[unbound-name]
-    if cfg.observables.density:
+    if cfg.observables.density and is_host_zero:
       density_matrix_file.close()  # pyrefly: ignore[unbound-name]

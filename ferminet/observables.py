@@ -305,6 +305,9 @@ def make_density_matrix(
       nelectrons=cfg.system.electrons,
       basis=cfg.observables.density_basis)
   scf_approx.run()
+  scf_approx.mo_coeff = jax.experimental.multihost_utils.broadcast_one_to_all(
+      scf_approx.mo_coeff
+  )
 
   if ckpt_state is not None:
     t = ckpt_state.t
