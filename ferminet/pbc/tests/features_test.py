@@ -239,6 +239,78 @@ class FeatureLayerTest(parameterized.TestCase):
     np.testing.assert_allclose(sign_0, sign_s, atol=1e-5)
     np.testing.assert_allclose(logpsi_0, logpsi_s, atol=1e-4, rtol=1e-4)
 
+  def test_multiwave_envelope_distinct_one_hot_columns(self):
+    """Tests backward-compatible default and distinct_kpoints_init=True."""
+    from ferminet.pbc import envelopes as pbc_envelopes
+
+    a_m = 151.18
+    prim_lattice = jnp.array(
+        [[a_m, -0.5 * a_m], [0.0, 0.5 * jnp.sqrt(3.0) * a_m]],
+        dtype=jnp.float32,
+    )
+    sim_lattice = prim_lattice @ jnp.array(
+        [[6.0, 0.0], [0.0, 3.0]], dtype=jnp.float32
+    )
+    nspins = (3, 3, 3, 3)
+    norb = sum(nspins)
+    ndet = 16
+    kpoints = pbc_envelopes.make_kpoints(sim_lattice, nspins, ndim=2)
+    nk = kpoints.shape[0]
+
+    # Default (distinct_kpoints_init=False) must keep all 1s in row 0.
+    default_env = pbc_envelopes.make_multiwave_envelope(kpoints)
+    default_params = default_env.init(
+        natom=1, output_dims=[norb * ndet] * 4, ndim=2
+    )
+    default_sigma = np.asarray(default_params[0]['linear_sigma'])
+    np.testing.assert_allclose(default_sigma[0, :], np.ones(norb * ndet))
+    np.testing.assert_allclose(default_sigma[1:, :], 0.0)
+
+    # Opt-in (distinct_kpoints_init=True) places one 1 per column at distinct
+    # independent Fourier mode rows.
+    envelope = pbc_envelopes.make_multiwave_envelope(
+        kpoints, distinct_kpoints_init=True
+    )
+    env_params = envelope.init(
+        natom=1, output_dims=[norb * ndet] * 4, ndim=2
+    )
+
+    sigma = np.asarray(env_params[0]['linear_sigma'])
+    self.assertEqual(sigma.shape, (2 * nk, norb * ndet))
+    # Every column must be one-hot (a single 1.0 and 0.0 elsewhere).
+    np.testing.assert_allclose(np.sum(sigma, axis=0), np.ones(norb * ndet))
+    np.testing.assert_allclose(np.max(sigma, axis=0), np.ones(norb * ndet))
+    np.testing.assert_allclose(np.min(sigma, axis=0), np.zeros(norb * ndet))
+
+    active_rows = np.argmax(sigma, axis=0)
+    # Row nk is sin(0 . r) == 0 and must never be selected.
+    self.assertTrue(np.all(active_rows != nk))
+    # Within every determinant block of size norb, all selected rows must be
+    # distinct.
+    for det_idx in range(ndet):
+      block_rows = active_rows[det_idx * norb : (det_idx + 1) * norb]
+      self.assertEqual(len(set(block_rows.tolist())), norb)
+
+    # Evaluating the envelope at norb distinct positions must yield linearly
+    # independent columns (full rank norb), unlike all-ones init (rank 1).
+    rng = np.random.default_rng(123)
+    all_sites = np.array(
+        [(i, j) for i in range(6) for j in range(3)], dtype=np.float32
+    )
+    chosen = rng.choice(len(all_sites), size=norb, replace=False)
+    site_coords = jnp.asarray(all_sites[chosen]) @ prim_lattice.T
+    ae = site_coords[:, None, :]
+    env_vals = np.asarray(
+        envelope.apply(
+            ae=ae,
+            r_ae=jnp.zeros((norb, 1, 1)),
+            r_ee=jnp.zeros((norb, norb, 1)),
+            **env_params[0],
+        )
+    )
+    det0_env_matrix = env_vals[:, :norb]
+    self.assertEqual(np.linalg.matrix_rank(det0_env_matrix, tol=1e-4), norb)
+
 
 if __name__ == '__main__':
   absltest.main()
