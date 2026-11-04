@@ -561,7 +561,9 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     kpoints = pbc_envelopes.make_kpoints(
         cfg.system.lattice, cfg.system.electrons, ndim=cfg.system.ndim
     )
-    envelope = pbc_envelopes.make_multiwave_envelope(kpoints)
+    envelope = pbc_envelopes.make_multiwave_envelope(
+        kpoints, **cfg.network.make_envelope_kwargs
+    )
   else:
     envelope = envelopes.make_isotropic_envelope()
 

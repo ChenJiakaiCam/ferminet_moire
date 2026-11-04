@@ -47,7 +47,44 @@ def migrate_multiwave_envelope_params(
 
 
 
-def make_multiwave_envelope(kpoints: jnp.ndarray) -> envelopes.Envelope:
+def _independent_wave_row_indices(kpoints: jnp.ndarray) -> jnp.ndarray:
+  """Returns row indices in ``[cos(k.r), sin(k.r)]`` for independent modes.
+
+  In ``make_multiwave_envelope``, ``waves`` concatenates ``cos(k_p . r)``
+  (rows ``0 .. nk - 1``) followed by ``sin(k_p . r)`` (rows ``nk .. 2*nk - 1``),
+  while ``make_kpoints`` includes both ``+k`` and ``-k`` for each non-zero wave
+  vector. To avoid duplicate ``cos(-k.r) == cos(k.r)`` columns and the
+  identically zero ``sin(0.r) == 0`` row:
+    - For ``k_p == 0``, selects row ``p`` (``cos(0) = 1``).
+    - For the first occurrence ``p`` of a ``+-k`` pair, selects row ``p``
+      (``cos(k_p . r)``).
+    - For the partner ``q > p`` with ``k_q == -k_p``, selects row ``nk + p``
+      (``sin(k_p . r)``).
+  """
+  kpts = np.asarray(kpoints, dtype=np.float64)
+  nk = kpts.shape[0]
+  norms = np.linalg.norm(kpts, axis=-1)
+  row_indices = []
+  for p in range(nk):
+    if norms[p] <= 1e-12:
+      row_indices.append(p)
+      continue
+    partner = None
+    for q in range(p):
+      if norms[q] > 1e-12 and np.linalg.norm(kpts[p] + kpts[q]) <= 1e-5 * norms[p]:
+        partner = q
+        break
+    if partner is None:
+      row_indices.append(p)
+    else:
+      row_indices.append(nk + partner)
+  return jnp.asarray(row_indices, dtype=jnp.int32)
+
+
+def make_multiwave_envelope(
+    kpoints: jnp.ndarray,
+    distinct_kpoints_init: bool = False,
+) -> envelopes.Envelope:
   """Returns an oscillatory envelope.
 
   Envelope consists of a sum of truncated 3D Fourier series, one centered on
@@ -55,19 +92,27 @@ def make_multiwave_envelope(kpoints: jnp.ndarray) -> envelopes.Envelope:
 
     sigma_{2i}*cos(kpoints_i.r_{ae}) + sigma_{2i+1}*sin(kpoints_i.r_{ae})
 
-  Initialization sets the coefficient of the first term in each
-  series to 1, and all other coefficients to 0. This corresponds to the
-  cosine of the first entry in kpoints. If this is [0, 0, 0], the envelope
-  will evaluate to unity at the beginning of training.
+  By default (``distinct_kpoints_init=False``), initialization sets the
+  coefficient of the first term (``kpoints[0]``) in each series to 1 and all
+  other coefficients to 0. When ``distinct_kpoints_init=True``, initialization
+  sets a single 1 in each column of ``linear_sigma`` at a distinct linearly
+  independent Fourier mode row (cycling through the ``nk`` independent
+  ``1, cos(k.r), sin(k.r)`` modes of ``kpoints``), and 0 elsewhere.
 
   Args:
     kpoints: Reciprocal lattice vectors of terms included in the Fourier series.
       Shape (nkpoints, ndim)
+    distinct_kpoints_init: If True, initialize each column of ``linear_sigma``
+      with a single 1 at a distinct independent Fourier mode row instead of
+      placing all 1s in row 0. Defaults to False for backward compatibility.
 
   Returns:
     An instance of ferminet.envelopes.Envelope with apply_type
     envelopes.EnvelopeType.PRE_DETERMINANT
   """
+  mode_rows = (
+      _independent_wave_row_indices(kpoints) if distinct_kpoints_init else None
+  )
 
   def init(
       natom: int, output_dims: Sequence[int], ndim: int = 3
@@ -77,11 +122,15 @@ def make_multiwave_envelope(kpoints: jnp.ndarray) -> envelopes.Envelope:
     params = []
     nk = kpoints.shape[0]
     for output_dim in output_dims:
-      # params.append({'sigma': jnp.zeros((2 * nk, output_dim))})
-      # params[-1]['sigma'] = params[-1]['sigma'].at[0, :].set(1.0)
-      params.append({'linear_sigma': jnp.zeros((2 * nk, output_dim))})
-      params[-1]['linear_sigma'] = params[-1]['linear_sigma'].at[0, :].set(1.0)
-      
+      linear_sigma = jnp.zeros((2 * nk, output_dim))
+      if distinct_kpoints_init and mode_rows is not None:
+        col_indices = jnp.arange(output_dim, dtype=jnp.int32)
+        row_indices = mode_rows[col_indices % nk]
+        linear_sigma = linear_sigma.at[row_indices, col_indices].set(1.0)
+      else:
+        linear_sigma = linear_sigma.at[0, :].set(1.0)
+      params.append({'linear_sigma': linear_sigma})
+
     return params
 
   def apply(*, ae: jnp.ndarray, r_ae: jnp.ndarray, r_ee: jnp.ndarray,
