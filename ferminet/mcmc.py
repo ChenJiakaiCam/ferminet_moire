@@ -18,7 +18,7 @@ NOTE: these functions operate on batches of MCMC configurations and should not
 be vmapped.
 """
 
-from typing import Callable
+from typing import Any, Callable, Literal, Mapping, Sequence, overload
 import chex
 from ferminet import constants
 from ferminet import networks
@@ -92,12 +92,12 @@ def mh_update(
     key: chex.PRNGKey,
     lp_1,
     num_accepts,
-    stddev=0.02,
+    stddev: float | jnp.ndarray = 0.02,
     atoms=None,
     ndim=3,
     map_to_cell: Callable[[jnp.ndarray], jnp.ndarray] = lambda x: x,
     blocks=1,
-    i=0,
+    i: int | jnp.ndarray = 0,
 ):
   """Performs one Metropolis-Hastings step using an all-electron move.
 
@@ -170,12 +170,12 @@ def mh_block_update(
     key: chex.PRNGKey,
     lp_1,
     num_accepts,
-    stddev=0.02,
+    stddev: float | jnp.ndarray = 0.02,
     atoms=None,
     ndim=3,
     map_to_cell: Callable[[jnp.ndarray], jnp.ndarray] = lambda x: x,
     blocks=1,
-    i=0,
+    i: int | jnp.ndarray = 0,
 ):
   """Performs one Metropolis-Hastings step for a block of electrons.
 
@@ -237,6 +237,447 @@ def mh_block_update(
   return new_data, key, lp_new, num_accepts
 
 
+def _resolve_layer_counts(
+    nspins: Sequence[int] | None,
+    layer_counts: tuple[int, int] | None,  # Try to resolve (n_electrons, n_holes) using layer_counts first, then nspins. If both are None, return (0, 0).
+) -> tuple[int, int]:
+  """Resolves (n_electrons, n_holes) from explicit layer_counts or nspins."""
+  if layer_counts is not None:
+    if len(layer_counts) != 2:
+      raise ValueError(
+          f'layer_counts must have length 2 (n_e, n_h), got {layer_counts}.'
+      )
+    n_e, n_h = int(layer_counts[0]), int(layer_counts[1])
+    if n_e < 0 or n_h < 0:
+      raise ValueError(
+          f'layer_counts entries must be non-negative, got {layer_counts}.'
+      )
+    return n_e, n_h
+  if nspins is None:
+    return 0, 0
+  counts = [int(n) for n in nspins]
+  if any(n < 0 for n in counts):
+    raise ValueError(f'All entries in nspins must be >= 0, got {nspins}.')
+  if len(counts) == 4:
+    return counts[0] + counts[1], counts[2] + counts[3]
+  if len(counts) == 2:
+    return counts[0], counts[1]
+  return 0, 0
+
+
+def _lll_reduced_basis(lattice: np.ndarray, delta: float = 0.75) -> np.ndarray:  # lattice is the simulation cell lattice vectors
+  """LLL-reduces a column-vector lattice basis for exact 1-shell MIC search."""
+  # Lenstra–Lenstra–Lovász (LLL) makes the basis vectors as short and as orthogonal as possible, which is useful for exact 1-shell MIC search.
+  basis = np.asarray(lattice, dtype=np.float64).T.copy()
+  ndim = basis.shape[0]
+  if not np.all(np.isfinite(basis)):
+    return np.asarray(lattice, dtype=np.float64)
+  norm_scale = np.linalg.norm(basis, axis=1).max()
+  if abs(np.linalg.det(basis)) <= np.finfo(np.float64).eps * norm_scale**ndim:
+    return np.asarray(lattice, dtype=np.float64)
+
+  def gram_schmidt():
+    _, r = np.linalg.qr(basis.T)
+    b_star_norm = np.diag(r)
+    mu = np.zeros((ndim, ndim), dtype=np.float64)
+    for idx in range(ndim):
+      mu[idx, :idx] = r[:idx, idx] / b_star_norm[:idx]
+    return b_star_norm, mu
+
+  k = 1
+  while k < ndim:
+    b_star_norm, mu = gram_schmidt()
+    for j in range(k - 1, -1, -1):
+      if abs(mu[k, j]) > 0.5:
+        basis[k] = basis[k] - np.round(mu[k, j]) * basis[j]
+        b_star_norm, mu = gram_schmidt()
+    lovasz = (delta - mu[k, k - 1] ** 2) * b_star_norm[k - 1] ** 2
+    if b_star_norm[k] ** 2 >= lovasz:
+      k += 1
+    else:
+      basis[[k, k - 1]] = basis[[k - 1, k]]
+      k = max(k - 1, 1)
+  return basis.T  # Transposed back so that the columns are the reduced basis vectors, as in the input lattice.
+
+
+def _make_minimum_image_dist_sq_fn(
+    lattice: jnp.ndarray | np.ndarray | None,
+) -> Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+  """Builds a pairwise squared distance function (with MIC in PBC)."""
+  if lattice is None:  # OBC
+    def obc_dist_sq_fn(pos_a: jnp.ndarray, pos_b: jnp.ndarray) -> jnp.ndarray:
+      diff = pos_a[..., :, None, :] - pos_b[..., None, :, :]
+      return jnp.sum(diff**2, axis=-1)
+    return obc_dist_sq_fn
+
+  reduced_np = _lll_reduced_basis(np.asarray(lattice, dtype=np.float64))
+  ndim = reduced_np.shape[0]
+  inv_reduced_np = np.linalg.inv(reduced_np)
+  grid = np.meshgrid(
+      *[np.array([-1, 0, 1]) for _ in range(ndim)], indexing='ij'
+  )
+  point_list = np.stack([g.ravel() for g in grid], axis=-1)
+  shifts_np = point_list @ reduced_np.T
+
+  def pbc_dist_sq_fn(pos_a: jnp.ndarray, pos_b: jnp.ndarray) -> jnp.ndarray:
+    dtype = pos_a.dtype
+    reduced = jnp.asarray(reduced_np, dtype=dtype)
+    inv_reduced = jnp.asarray(inv_reduced_np, dtype=dtype)
+    shifts = jnp.asarray(shifts_np, dtype=dtype)
+
+    diff = pos_a[..., :, None, :] - pos_b[..., None, :, :]
+    frac_diff = diff @ inv_reduced.T
+    wrapped = diff - jnp.round(frac_diff) @ reduced.T
+    diff_all = wrapped[..., None, :] + shifts
+    dists_sq_all = jnp.sum(diff_all**2, axis=-1)
+    return jnp.min(dists_sq_all, axis=-1)  # Note this is actual minimum image distance, not the periodic distance feature. Shape (for ground state) is (batch, n_e, n_h).
+
+  return pbc_dist_sq_fn
+
+
+def _find_mutual_eh_pairs(
+    pos_e: jnp.ndarray,
+    pos_h: jnp.ndarray,
+    pair_radius: float,
+    dist_sq_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray],
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+  """Identifies mutual nearest-neighbor (e, h) pairs within pair_radius.
+
+  # i.e. Heuristic for finding excitons: find pairs such that interaction between the pair is stronger than interaction with other electrons and holes. Note 1,2 need not be true/false at the same time.
+  An electron i and hole j are paired if and only if:
+    1. Hole j is the nearest hole to electron i,
+    2. Electron i is the nearest electron to hole j, and
+    3. Their minimum-image in-plane distance satisfies r_ij < pair_radius.
+
+  Args:
+    pos_e: Electron coordinates of shape (batch, n_e, ndim).
+    pos_h: Hole coordinates of shape (batch, n_h, ndim).
+    pair_radius: Cutoff radius R_c (in Bohr) for pairing.
+    dist_sq_fn: Callable returning squared distances of shape (batch, n_e, n_h).
+
+  Returns:
+    Tuple (partner_h_for_e, is_paired_e), where:
+      partner_h_for_e: Integer array of shape (batch, n_e) with the paired hole
+        index in [0, n_h) for paired electrons and -1 for unpaired electrons.
+      is_paired_e: Boolean array of shape (batch, n_e) indicating whether each
+        electron is part of a valid mutual pair.
+  """
+  n_e = pos_e.shape[1]
+  dist_sq = dist_sq_fn(pos_e, pos_h)  # (batch, n_e, n_h)
+  nearest_h_for_e = jnp.argmin(dist_sq, axis=-1)  # (batch, n_e)
+  min_dist_sq_e = jnp.min(dist_sq, axis=-1)  # (batch, n_e)
+  nearest_e_for_h = jnp.argmin(dist_sq, axis=-2)  # (batch, n_h)
+
+  partner_e_of_nearest_h = jnp.take_along_axis(
+      nearest_e_for_h, nearest_h_for_e, axis=-1
+  )  # (batch, n_e)
+  e_indices = jnp.arange(n_e, dtype=nearest_h_for_e.dtype)[None, :]
+  is_mutual = partner_e_of_nearest_h == e_indices
+  is_paired_e = is_mutual & (min_dist_sq_e < (pair_radius**2))
+  partner_h_for_e = jnp.where(is_paired_e, nearest_h_for_e, -1)
+  return partner_h_for_e, is_paired_e  # partner_h_for_e shaped (batch, n_e), gives the index of the paired hole for each electron, or -1 if unpaired. is_paired_e shaped (batch, n_e), gives True if electron is paired, False otherwise.
+
+
+def _mh_pair_update_with_diagnostics(
+    params: networks.ParamTree,
+    f: networks.LogFermiNetLike | Callable[..., jnp.ndarray],
+    data: networks.FermiNetData,
+    key: chex.PRNGKey,
+    lp_1: Any,
+    num_accepts: Any,
+    stddev: float | jnp.ndarray = 0.02,
+    atoms: Any = None,
+    ndim: int = 2,
+    map_to_cell: Callable[[jnp.ndarray], jnp.ndarray] = lambda x: x,
+    blocks: int = 1,
+    i: int | jnp.ndarray = 0,
+    layer_counts: tuple[int, int] = (0, 0),
+    pair_radius: float = 0.0,
+    dist_sq_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray] | None = None,
+    unpaired_stddev: float | jnp.ndarray | None = None,
+) -> tuple[
+    networks.FermiNetData,
+    chex.PRNGKey,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]:
+  """Internal pair MH update returning full 8-tuple diagnostics."""
+  if atoms is not None:
+    raise NotImplementedError(
+        'Asymmetric nuclear-distance scaling is not supported for pair moves.'
+    )
+  n_e, n_h = layer_counts
+  if n_e <= 0 or n_h <= 0 or pair_radius <= 0.0:
+    fallback_fn = mh_block_update if blocks > 1 else mh_update
+    out_data, out_key, out_lp, out_acc = fallback_fn(
+        params,
+        f,
+        data,
+        key,
+        lp_1,
+        num_accepts,
+        stddev=stddev,
+        atoms=atoms,
+        ndim=ndim,
+        map_to_cell=map_to_cell,
+        blocks=blocks,
+        i=i,
+    )
+    zero = jnp.zeros((), dtype=jnp.float32)
+    return (out_data, out_key, out_lp, out_acc, zero, zero, zero, zero)
+
+  if dist_sq_fn is None:
+    dist_sq_fn = _make_minimum_image_dist_sq_fn(None)
+
+  key, subkey_h, subkey_e = jax.random.split(key, 3)
+  x1 = data.positions
+  batch_size = x1.shape[0]
+  nelec = n_e + n_h
+  num_states = max(1, x1.shape[1] // (nelec * ndim))
+
+  pos_1 = jnp.reshape(x1, [batch_size * num_states, nelec, ndim])
+  pos_e_1 = pos_1[:, :n_e, :]
+  pos_h_1 = pos_1[:, n_e:, :]
+
+  partner_h_1, is_paired_e_1 = _find_mutual_eh_pairs(
+      pos_e_1, pos_h_1, pair_radius, dist_sq_fn
+  )
+
+  unpaired_std = stddev if unpaired_stddev is None else unpaired_stddev
+  h_indices = jnp.arange(n_h)[None, None, :]
+  is_paired_h_1 = jnp.any(partner_h_1[..., :, None] == h_indices, axis=-2)
+  sigma_h = jnp.where(is_paired_h_1[..., None], stddev, unpaired_std)
+
+  eta_h = sigma_h * jax.random.normal(subkey_h, shape=pos_h_1.shape)
+  eta_e_indep = unpaired_std * jax.random.normal(subkey_e, shape=pos_e_1.shape)
+
+  if blocks > 1:
+    blocks_per_state = max(1, blocks // num_states)
+    h_blocks_per_state = min(blocks_per_state, n_h)
+    e_blocks_per_state = min(blocks_per_state, n_e)
+    ii = i % blocks
+    s_active = (ii // blocks_per_state) % num_states
+    b_active = ii % blocks_per_state
+    h_b_active = b_active % h_blocks_per_state
+    e_b_active = b_active % e_blocks_per_state
+    state_idx = jnp.tile(jnp.arange(num_states), batch_size)[:, None, None]
+    active_state = state_idx == s_active
+    active_h_block = (
+        (jnp.arange(n_h) % h_blocks_per_state) == h_b_active
+    )[None, :, None]
+    active_e_block = (
+        (jnp.arange(n_e) % e_blocks_per_state) == e_b_active
+    )[None, :, None]
+    eta_h = jnp.where(active_state & active_h_block, eta_h, 0.0)
+    eta_e_indep = jnp.where(active_state & active_e_block, eta_e_indep, 0.0)
+    active_paired_h = is_paired_h_1 & (
+        active_state[..., 0] & active_h_block[..., 0]
+    )
+  else:
+    active_paired_h = is_paired_h_1
+
+  safe_partner_h_1 = jnp.maximum(partner_h_1, 0)
+  paired_eta_e = jnp.take_along_axis(
+      eta_h, safe_partner_h_1[..., None], axis=1
+  )
+  eta_e = jnp.where(is_paired_e_1[..., None], paired_eta_e, eta_e_indep)
+
+  pos_e_2 = pos_e_1 + eta_e
+  pos_h_2 = pos_h_1 + eta_h
+  pos_2 = jnp.concatenate([pos_e_2, pos_h_2], axis=1)
+  x2 = jnp.reshape(pos_2, [batch_size, -1])
+  x2 = map_to_cell(x2)
+
+  pos_2_wrapped = jnp.reshape(x2, [batch_size * num_states, nelec, ndim])
+  pos_e_2_w = pos_2_wrapped[:, :n_e, :]
+  pos_h_2_w = pos_2_wrapped[:, n_e:, :]
+  partner_h_2, _ = _find_mutual_eh_pairs(
+      pos_e_2_w, pos_h_2_w, pair_radius, dist_sq_fn
+  )
+  same_pairing = jnp.all(
+      jnp.reshape(partner_h_1 == partner_h_2, [batch_size, -1]), axis=-1
+  )
+  moved = jnp.any(x2 != x1, axis=-1)
+
+  lp_2 = 2.0 * f(params, x2, data.spins, data.atoms, data.charges)
+  ratio = jnp.asarray(jnp.where(same_pairing & moved, lp_2 - lp_1, -jnp.inf))
+  key, accept_subkey = jax.random.split(key)
+  rnd = jnp.log(jax.random.uniform(accept_subkey, shape=ratio.shape))
+  cond = ratio > rnd
+  x_new = jnp.asarray(jnp.where(cond[..., None], x2, x1))
+  lp_new = jnp.asarray(jnp.where(cond, lp_2, lp_1))
+  num_accepts = num_accepts + jnp.sum(cond)
+  new_data = networks.FermiNetData(**(dict(data) | {'positions': x_new}))  # type: ignore[arg-type]  # pyrefly: ignore[no-matching-overload]
+
+  num_map_rejects = jnp.sum((moved & (~same_pairing)).astype(jnp.float32))
+  pairs_per_walker = jnp.sum(
+      jnp.reshape(is_paired_e_1, [batch_size, -1]).astype(jnp.float32),
+      axis=-1,
+  )
+  total_pairs = jnp.sum(pairs_per_walker)
+  has_active_pair = jnp.any(
+      jnp.reshape(active_paired_h, [batch_size, -1]), axis=-1
+  )
+  active_pair_tries = jnp.sum(has_active_pair.astype(jnp.float32))
+  active_pair_accepts = jnp.sum((cond & has_active_pair).astype(jnp.float32))
+  return (
+      new_data,
+      key,
+      lp_new,
+      num_accepts,
+      num_map_rejects,
+      total_pairs,
+      active_pair_tries,
+      active_pair_accepts,
+  )
+
+
+@overload
+def mh_pair_update(
+    params: networks.ParamTree,
+    f: networks.LogFermiNetLike | Callable[..., jnp.ndarray],
+    data: networks.FermiNetData,
+    key: chex.PRNGKey,
+    lp_1: Any,
+    num_accepts: Any,
+    stddev: float | jnp.ndarray = ...,
+    atoms: Any = ...,
+    ndim: int = ...,
+    map_to_cell: Callable[[jnp.ndarray], jnp.ndarray] = ...,
+    blocks: int = ...,
+    i: int | jnp.ndarray = ...,
+    layer_counts: tuple[int, int] = ...,
+    pair_radius: float = ...,
+    dist_sq_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray] | None = ...,
+    unpaired_stddev: float | jnp.ndarray | None = ...,
+    return_pair_diagnostics: Literal[False] = ...,
+) -> tuple[networks.FermiNetData, chex.PRNGKey, jnp.ndarray, jnp.ndarray]:
+  ...
+
+
+@overload
+def mh_pair_update(
+    params: networks.ParamTree,
+    f: networks.LogFermiNetLike | Callable[..., jnp.ndarray],
+    data: networks.FermiNetData,
+    key: chex.PRNGKey,
+    lp_1: Any,
+    num_accepts: Any,
+    stddev: float | jnp.ndarray = ...,
+    atoms: Any = ...,
+    ndim: int = ...,
+    map_to_cell: Callable[[jnp.ndarray], jnp.ndarray] = ...,
+    blocks: int = ...,
+    i: int | jnp.ndarray = ...,
+    layer_counts: tuple[int, int] = ...,
+    pair_radius: float = ...,
+    dist_sq_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray] | None = ...,
+    unpaired_stddev: float | jnp.ndarray | None = ...,
+    *,
+    return_pair_diagnostics: Literal[True],
+) -> tuple[
+    networks.FermiNetData,
+    chex.PRNGKey,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]:
+  ...
+
+
+def mh_pair_update(
+    params: networks.ParamTree,
+    f: networks.LogFermiNetLike | Callable[..., jnp.ndarray],
+    data: networks.FermiNetData,
+    key: chex.PRNGKey,
+    lp_1: Any,
+    num_accepts: Any,
+    stddev: float | jnp.ndarray = 0.02,
+    atoms: Any = None,
+    ndim: int = 2,
+    map_to_cell: Callable[[jnp.ndarray], jnp.ndarray] = lambda x: x,
+    blocks: int = 1,
+    i: int | jnp.ndarray = 0,
+    layer_counts: tuple[int, int] = (0, 0),
+    pair_radius: float = 0.0,
+    dist_sq_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray] | None = None,
+    unpaired_stddev: float | jnp.ndarray | None = None,
+    return_pair_diagnostics: bool = False,
+):
+  """Performs one Metropolis-Hastings step shifting bound (e, h) pairs together.
+
+  Mutual nearest-neighbor electron-hole pairs within `pair_radius` are shifted
+  by the same Gaussian displacement vector (with width `stddev`, i.e. sigma_p)
+  so that bound excitons translate across the moire potential without stretching
+  their internal relative coordinate r_e - r_h. Unpaired particles are shifted
+  independently with width `unpaired_stddev` (i.e. sigma_n, defaulting to
+  `stddev` if not specified). Exact detailed balance is enforced by requiring
+  the mutual-nearest-neighbor pairing map within `pair_radius` to be identical
+  in the initial and proposed configurations.
+
+  Args:
+    params: Wavefunction parameters.
+    f: Callable with LogFermiNetLike signature returning log|psi|.
+    data: Initial MCMC configurations (batched).
+    key: RNG state.
+    lp_1: Log probability 2*log|psi(x1)|.
+    num_accepts: Running total of accepted MH moves.
+    stddev: Width of Gaussian move proposal for matched pairs (sigma_p).
+    atoms: Must be None (asymmetric nuclear scaling is not supported).
+    ndim: Dimensionality of system.
+    map_to_cell: Callable mapping positions into the simulation cell in PBC.
+    blocks: Number of blocks to split updates into.
+    i: Index of active block when blocks > 1.
+    layer_counts: Tuple (n_electrons, n_holes) of particle counts per layer.
+    pair_radius: Cutoff radius R_c (in Bohr) for pairing an electron and hole.
+    dist_sq_fn: Pairwise squared distance function (minimum-image in PBC).
+    unpaired_stddev: Optional width of Gaussian move proposal for unpaired
+      particles (sigma_n). Defaults to `stddev` when None.
+    return_pair_diagnostics: If True, also returns `(num_map_rejects,
+      total_pairs, active_pair_tries, active_pair_accepts)` for the step.
+
+  Returns:
+    Tuple `(new_data, key, lp_new, num_accepts)` by default, or
+    `(new_data, key, lp_new, num_accepts, num_map_rejects, total_pairs,
+    active_pair_tries, active_pair_accepts)` when
+    `return_pair_diagnostics=True`.
+    num_map_rejects: Number of proposals rejected due to pairing map mismatch.
+    total_pairs: Total number of mutual (e, h) pairs summed over the batch.
+    active_pair_tries: How many walkers (out of batch_size) actually translated
+      at least one matched pair in this step.
+    active_pair_accepts: How many walkers translated at least one matched pair
+      and were accepted in this step.
+  """
+  out = _mh_pair_update_with_diagnostics(
+      params=params,
+      f=f,
+      data=data,
+      key=key,
+      lp_1=lp_1,
+      num_accepts=num_accepts,
+      stddev=stddev,
+      atoms=atoms,
+      ndim=ndim,
+      map_to_cell=map_to_cell,
+      blocks=blocks,
+      i=i,
+      layer_counts=layer_counts,
+      pair_radius=pair_radius,
+      dist_sq_fn=dist_sq_fn,
+      unpaired_stddev=unpaired_stddev,
+  )
+  if return_pair_diagnostics:
+    return out
+  return out[:4]
+
+
 def make_mcmc_step(
     batch_network,
     batch_per_device,
@@ -245,6 +686,12 @@ def make_mcmc_step(
     ndim=3,
     blocks=1,
     lattice=None,
+    nspins: Sequence[int] | None = None,
+    layer_counts: tuple[int, int] | None = None,
+    pair_prob: float = 0.0,
+    pair_radius: float = 0.0,
+    pair_width_scale: float = 1.0,
+    return_stats: bool = False,
 ):
   """Creates the MCMC step function.
 
@@ -263,10 +710,49 @@ def make_mcmc_step(
       moves.
     lattice: If None, assume OBC. Otherwise matrix with supercell lattice
       vectors
+    nspins: Optional sequence of particle counts per spin/layer channel used to
+      infer (n_electrons, n_holes) when `layer_counts` is not explicitly given.
+    layer_counts: Optional explicit tuple (n_electrons, n_holes).
+    pair_prob: Probability in [0, 1) of performing a joint electron-hole pair
+      move on each MCMC sweep. Defaults to 0.0 (disabled). Must be strictly less
+      than 1.0 so ordinary single-particle moves remain present to equilibrate
+      internal pair separations.
+    pair_radius: Cutoff distance (in Bohr) within which mutual nearest-neighbor
+      electron-hole pairs are shifted together during pair moves.
+    pair_width_scale: Initial or fallback multiplicative scale factor applied to
+      `width` during joint pair moves when `width` is passed as a scalar.
+      Defaults to 1.0.
+    return_stats: If True, `mcmc_step` returns `(new_data, stats_dict)` with
+      separate ordinary/pair attempt and acceptance counts, acceptance rates,
+      pair-map rejection rate, and mean number of identified pairs per walker.
+      Defaults to False for full backward compatibility.
 
   Returns:
     Callable which performs the set of MCMC steps.
   """
+  pair_prob = float(pair_prob)
+  if not 0.0 <= pair_prob < 1.0:
+    raise ValueError(
+        'pair_prob must be in [0, 1) so ordinary single-particle moves are '
+        'present to equilibrate internal pair separations and partner '
+        f'changes, got {pair_prob}.'
+    )
+  pair_radius = float(pair_radius)
+  pair_width_scale = float(pair_width_scale)
+  if pair_width_scale <= 0.0:
+    raise ValueError(
+        f'pair_width_scale must be positive, got {pair_width_scale}.'
+    )
+
+  resolved_layer_counts = _resolve_layer_counts(nspins, layer_counts)
+  n_e, n_h = resolved_layer_counts
+  use_pair_moves = (pair_prob > 0.0) and (n_e > 0) and (n_h > 0)
+  if use_pair_moves and pair_radius <= 0.0:
+    raise ValueError(
+        'pair_radius must be > 0 when pair_prob > 0 and both carrier layers '
+        f'are occupied, got pair_radius={pair_radius}.'
+    )
+
   inner_fun = mh_block_update if blocks > 1 else mh_update
 
   # If PBC, map electrons back to the supercell
@@ -277,46 +763,362 @@ def make_mcmc_step(
     rec = None
     map_to_cell = lambda p: p
 
-  def mcmc_step(params, data, key, width):
+  dist_sq_fn = (
+      _make_minimum_image_dist_sq_fn(lattice) if use_pair_moves else None
+  )
+
+  def mcmc_step(params, data, key, width) -> tuple[networks.FermiNetData, Any]:
     """Performs a set of MCMC steps.
 
     Args:
       params: parameters to pass to the network.
       data: (batched) MCMC configurations to pass to the network.
       key: RNG state.
-      width: standard deviation to use in the move proposal.
+      width: standard deviation to use in the move proposal. May be a scalar
+        (in which case ordinary moves use `width` and pair moves use
+        `width * pair_width_scale`) or a length-2 array `[width_normal,
+        width_pair]` with independently adapted widths.
 
     Returns:
-      (data, pmove), where data is the updated MCMC configurations, key the
-      updated RNG state and pmove the average probability a move was accepted.
+      `(data, pmove)` when `return_stats=False`, or `(data, stats_dict)` when
+      `return_stats=True`.
     """
     pos = data.positions
-
-    def step_fn(i, x):
-      return inner_fun(
-          params,
-          batch_network,
-          *x,
-          stddev=width,
-          atoms=atoms,
-          ndim=ndim,
-          map_to_cell=map_to_cell,
-          blocks=blocks,
-          i=i
-      )
+    width_arr = jnp.asarray(width)
+    if width_arr.ndim > 0 and width_arr.shape[-1] == 2:
+      normal_width = width_arr[..., 0]
+      pair_width = width_arr[..., 1]
+    else:
+      normal_width = width
+      pair_width = width * pair_width_scale
 
     nsteps = steps * blocks
     logprob = 2.0 * batch_network(
         params, pos, data.spins, data.atoms, data.charges
     )
-    new_data, key, _, num_accepts = lax.fori_loop(
-        0, nsteps, step_fn, (data, key, logprob, 0.0)
+
+    if not use_pair_moves and not return_stats:
+      def legacy_single_step_fn(i, x):
+        return inner_fun(
+            params,
+            batch_network,
+            *x,
+            stddev=normal_width,
+            atoms=atoms,
+            ndim=ndim,
+            map_to_cell=map_to_cell,
+            blocks=blocks,
+            i=i,
+        )
+
+      new_data, key, _, num_accepts = lax.fori_loop(
+          0, nsteps, legacy_single_step_fn, (data, key, logprob, 0.0)
+      )
+      pmove = jnp.sum(num_accepts) / (nsteps * batch_per_device)
+      pmove = constants.pmean(pmove)
+      return new_data, pmove
+
+    if use_pair_moves:
+      key, mode_key = jax.random.split(key)
+      do_pair_sweeps = jax.random.bernoulli(
+          mode_key, p=pair_prob, shape=(max(1, steps),)
+      )
+      if steps >= 2:
+        # Guarantee at least one ordinary single-particle sweep per mcmc_step
+        # call so internal relative coordinates always equilibrate.
+        do_pair_sweeps = jnp.where(
+            jnp.all(do_pair_sweeps),
+            do_pair_sweeps.at[0].set(False),
+            do_pair_sweeps,
+        )
+    else:
+      do_pair_sweeps = jnp.zeros((max(1, steps),), dtype=bool)
+
+    batch_f = jnp.asarray(float(batch_per_device), dtype=jnp.float32)
+
+    def tracked_normal_step(i, carry):
+      (
+          cur_data,
+          cur_key,
+          cur_lp,
+          acc_n,
+          try_n,
+          acc_p,
+          try_p,
+          acc_p_active,
+          try_p_active,
+          map_rej_p,
+          sum_pairs_p,
+      ) = carry
+      next_data, next_key, next_lp, step_acc = inner_fun(
+          params,
+          batch_network,
+          cur_data,
+          cur_key,
+          cur_lp,
+          0.0,
+          stddev=normal_width,
+          atoms=atoms,
+          ndim=ndim,
+          map_to_cell=map_to_cell,
+          blocks=blocks,
+          i=i,
+      )
+      acc_n = acc_n + jnp.sum(step_acc).astype(jnp.float32)
+      try_n = try_n + batch_f
+      return (
+          next_data,
+          next_key,
+          next_lp,
+          acc_n,
+          try_n,
+          acc_p,
+          try_p,
+          acc_p_active,
+          try_p_active,
+          map_rej_p,
+          sum_pairs_p,
+      )
+
+    def tracked_pair_step(i, carry):
+      (
+          cur_data,
+          cur_key,
+          cur_lp,
+          acc_n,
+          try_n,
+          acc_p,
+          try_p,
+          acc_p_active,
+          try_p_active,
+          map_rej_p,
+          sum_pairs_p,
+      ) = carry
+      (
+          next_data,
+          next_key,
+          next_lp,
+          step_acc,
+          step_map_rej,
+          step_pairs,
+          step_try_active,
+          step_acc_active,
+      ) = _mh_pair_update_with_diagnostics(
+          params,
+          batch_network,
+          cur_data,
+          cur_key,
+          cur_lp,
+          0.0,
+          stddev=pair_width,
+          atoms=atoms,
+          ndim=ndim,
+          map_to_cell=map_to_cell,
+          blocks=blocks,
+          i=i,
+          layer_counts=resolved_layer_counts,
+          pair_radius=pair_radius,
+          dist_sq_fn=dist_sq_fn,
+          unpaired_stddev=normal_width,
+      )
+      acc_p = acc_p + jnp.sum(step_acc).astype(jnp.float32)
+      try_p = try_p + batch_f
+      acc_p_active = acc_p_active + jnp.sum(step_acc_active).astype(jnp.float32)
+      try_p_active = try_p_active + jnp.sum(step_try_active).astype(jnp.float32)
+      map_rej_p = map_rej_p + jnp.sum(step_map_rej).astype(jnp.float32)
+      sum_pairs_p = sum_pairs_p + jnp.sum(step_pairs).astype(jnp.float32)
+      return (
+          next_data,
+          next_key,
+          next_lp,
+          acc_n,
+          try_n,
+          acc_p,
+          try_p,
+          acc_p_active,
+          try_p_active,
+          map_rej_p,
+          sum_pairs_p,
+      )
+
+    def step_fn(i, carry):
+      if not use_pair_moves:
+        return tracked_normal_step(i, carry)
+      do_pair = do_pair_sweeps[i // blocks]
+      return lax.cond(
+          do_pair,
+          lambda args: tracked_pair_step(*args),
+          lambda args: tracked_normal_step(*args),
+          (i, carry),
+      )
+
+    zero_f = jnp.zeros((), dtype=jnp.float32)
+    init_carry = (
+        data,
+        key,
+        logprob,
+        zero_f,
+        zero_f,
+        zero_f,
+        zero_f,
+        zero_f,
+        zero_f,
+        zero_f,
+        zero_f,
     )
-    pmove = jnp.sum(num_accepts) / (nsteps * batch_per_device)
-    pmove = constants.pmean(pmove)
-    return new_data, pmove
+    (
+        new_data,
+        key,
+        _,
+        n_acc_normal,
+        n_try_normal,
+        n_acc_pair,
+        n_try_pair,
+        n_acc_pair_active,
+        n_try_pair_active,
+        n_map_rej_pair,
+        sum_pairs,
+    ) = lax.fori_loop(0, nsteps, step_fn, init_carry)
+
+    n_acc_normal = constants.psum(n_acc_normal)
+    n_try_normal = constants.psum(n_try_normal)
+    n_acc_pair = constants.psum(n_acc_pair)
+    n_try_pair = constants.psum(n_try_pair)
+    n_acc_pair_active = constants.psum(n_acc_pair_active)
+    n_try_pair_active = constants.psum(n_try_pair_active)
+    n_map_rej_pair = constants.psum(n_map_rej_pair)
+    sum_pairs = constants.psum(sum_pairs)
+
+    total_acc = n_acc_normal + n_acc_pair
+    total_try = n_try_normal + n_try_pair
+    pmove = jnp.where(
+        total_try > 0.0, total_acc / jnp.maximum(total_try, 1.0), 0.0
+    )
+    if not return_stats:
+      return new_data, pmove
+
+    pmove_normal = jnp.where(
+        n_try_normal > 0.0,
+        n_acc_normal / jnp.maximum(n_try_normal, 1.0),
+        jnp.nan,
+    )
+    pmove_pair = jnp.where(
+        n_try_pair > 0.0,
+        n_acc_pair / jnp.maximum(n_try_pair, 1.0),
+        jnp.nan,
+    )
+    pmove_pair_active = jnp.where(
+        n_try_pair_active > 0.0,
+        n_acc_pair_active / jnp.maximum(n_try_pair_active, 1.0),
+        jnp.nan,
+    )
+    pair_map_reject_rate = jnp.where(
+        n_try_pair > 0.0,
+        n_map_rej_pair / jnp.maximum(n_try_pair, 1.0),
+        jnp.nan,
+    )
+    mean_num_pairs = jnp.where(
+        n_try_pair > 0.0,
+        sum_pairs / jnp.maximum(n_try_pair, 1.0),
+        jnp.nan,
+    )
+    stats = {
+        'pmove': pmove,
+        'pmove_normal': pmove_normal,
+        'pmove_pair': pmove_pair,
+        'pmove_pair_active': pmove_pair_active,
+        'n_try_normal': n_try_normal,
+        'n_acc_normal': n_acc_normal,
+        'n_try_pair': n_try_pair,
+        'n_acc_pair': n_acc_pair,
+        'n_try_pair_active': n_try_pair_active,
+        'n_acc_pair_active': n_acc_pair_active,
+        'n_map_rej_pair': n_map_rej_pair,
+        'pair_map_reject_rate': pair_map_reject_rate,
+        'mean_num_pairs': mean_num_pairs,
+    }
+    return new_data, stats
 
   return mcmc_step
+
+
+def init_pair_mcmc_adaptation_state(
+    adapt_frequency: int,
+) -> dict[str, np.ndarray]:
+  """Initializes window buffers for separate ordinary/pair width adaptation."""
+  n = max(1, int(adapt_frequency))
+  return {
+      'try_normal': np.zeros(n, dtype=np.float64),
+      'acc_normal': np.zeros(n, dtype=np.float64),
+      'try_pair': np.zeros(n, dtype=np.float64),
+      'acc_pair': np.zeros(n, dtype=np.float64),
+  }
+
+
+def update_pair_mcmc_widths(
+    t: int,
+    width: jnp.ndarray,
+    adapt_frequency: int,
+    mcmc_stats: Mapping[str, jnp.ndarray | np.ndarray | float],
+    adapt_state: dict[str, np.ndarray],
+    pmove_max: float = 0.55,
+    pmove_min: float = 0.5,
+) -> tuple[jnp.ndarray, dict[str, np.ndarray]]:
+  """Independently adapts [normal_width, pair_width] from accumulated counts.
+
+  Accumulates attempt and acceptance counts for ordinary and pair moves across
+  the `adapt_frequency` window before dividing:
+    - `A_n = sum(N_{acc,n}) / sum(N_{try,n})` updates `width[..., 0]` (sigma_n)
+    - `A_p = sum(N_{acc,p,active}) / sum(N_{try,p,active})` updates
+      `width[..., 1]` (sigma_p), counting only walker/block proposals that
+      actually translated at least one matched pair.
+  If a move type has zero qualifying attempts over the window, its width update
+  is skipped.
+  """
+  if adapt_frequency <= 0:
+    return width, adapt_state
+  t_since_update = t % adapt_frequency
+  try_p_key = (
+      'n_try_pair_active'
+      if 'n_try_pair_active' in mcmc_stats
+      else 'n_try_pair'
+  )
+  acc_p_key = (
+      'n_acc_pair_active'
+      if 'n_acc_pair_active' in mcmc_stats
+      else 'n_acc_pair'
+  )
+  adapt_state['try_normal'][t_since_update] = float(
+      np.asarray(mcmc_stats['n_try_normal']).reshape(-1)[0]
+  )
+  adapt_state['acc_normal'][t_since_update] = float(
+      np.asarray(mcmc_stats['n_acc_normal']).reshape(-1)[0]
+  )
+  adapt_state['try_pair'][t_since_update] = float(
+      np.asarray(mcmc_stats[try_p_key]).reshape(-1)[0]
+  )
+  adapt_state['acc_pair'][t_since_update] = float(
+      np.asarray(mcmc_stats[acc_p_key]).reshape(-1)[0]
+  )
+
+  if t > 0 and t_since_update == 0:
+    total_try_n = float(np.sum(adapt_state['try_normal']))
+    if total_try_n > 0.0:
+      a_n = float(np.sum(adapt_state['acc_normal'])) / total_try_n
+      if a_n > pmove_max:
+        width = width.at[..., 0].multiply(1.1)
+      elif a_n < pmove_min:
+        width = width.at[..., 0].divide(1.1)
+
+    total_try_p = float(np.sum(adapt_state['try_pair']))
+    if total_try_p > 0.0:
+      a_p = float(np.sum(adapt_state['acc_pair'])) / total_try_p
+      if a_p > pmove_max:
+        width = width.at[..., 1].multiply(1.1)
+      elif a_p < pmove_min:
+        width = width.at[..., 1].divide(1.1)
+
+  return width, adapt_state
 
 
 def update_mcmc_width(
