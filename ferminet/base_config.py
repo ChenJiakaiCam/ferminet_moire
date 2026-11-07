@@ -232,16 +232,23 @@ def default() -> ml_collections.ConfigDict:
           # mean of the distance to the nuclei.
           'scale_by_nuclear_distance': False,
           'blocks': 1,  # Number of blocks to split the MCMC sampling into
-          # Probability in [0, 1] of proposing a joint electron-hole pair move
-          # on each MCMC sweep (0.0 disables pair moves for full backward
-          # compatibility).
+          # Probability in [0, 1) of proposing a joint electron-hole pair move
+          # (inter-well moire lattice hop when pair_lattice / moire_lattice is
+          # present) on each MCMC sweep (0.0 disables pair moves for full
+          # backward compatibility).
           'pair_prob': 0.0,
           # Cutoff radius (in Bohr) for identifying bound electron-hole pairs in
           # pair MCMC moves. If <= 0 when pair_prob > 0 in a bilayer system,
           # defaults to 1.5 * interlayer_distance.
           'pair_radius': 0.0,
+          # Optional (ndim, ndim) primitive lattice matrix (columns are direct
+          # lattice vectors) defining nearest-neighbor inter-well pair-hop
+          # translations. When None in a moire bilayer system, defaults to the
+          # 1x1 primitive moire lattice (moire_lattice).
+          'pair_lattice': None,
           # Multiplicative scale factor applied to the MCMC move width during
-          # joint electron-hole pair moves.
+          # fallback Gaussian joint electron-hole pair moves when pair_lattice
+          # is None.
           'pair_width_scale': 1.0,
           # Minimum batch-averaged fraction of min(n_electrons, n_holes) bound
           # into mutual nearest-neighbor pairs required before enabling joint

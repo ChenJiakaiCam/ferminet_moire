@@ -1129,6 +1129,525 @@ class McmcTest(parameterized.TestCase):
     self.assertAlmostEqual(float(width[0, 0]), 0.2, places=6)
     self.assertAlmostEqual(float(width[0, 1]), 3.0 * 1.1, places=6)
 
+  def test_make_moire_hop_vectors_triangular_and_square(self):
+    """_make_moire_hop_vectors returns exact nearest-neighbor lattice vectors in +/- pairs."""
+    a_m = 151.18
+    # 120-degree triangular moire lattice
+    prim_120 = geometry.triangular_lattice(a_m)
+    vecs_120 = np.asarray(mcmc._make_moire_hop_vectors(prim_120, ndim=2))
+    self.assertEqual(vecs_120.shape, (6, 2))
+    norms_120 = np.linalg.norm(vecs_120, axis=-1)
+    np.testing.assert_allclose(norms_120, np.full(6, a_m), rtol=1e-5, atol=1e-4)
+    # Every vector +a must have its exact opposite -a in the set
+    for v in vecs_120:
+      dists_to_neg = np.linalg.norm(vecs_120 - (-v)[None, :], axis=-1)
+      self.assertLess(float(np.min(dists_to_neg)), 1e-4)
+
+    # 60-degree triangular moire lattice (a_1 = a_1_120, a_2 = a_1_120 + a_2_120)
+    prim_60 = np.column_stack([prim_120[:, 0], prim_120[:, 0] + prim_120[:, 1]])
+    vecs_60 = np.asarray(mcmc._make_moire_hop_vectors(prim_60, ndim=2))
+    self.assertEqual(vecs_60.shape, (6, 2))
+    norms_60 = np.linalg.norm(vecs_60, axis=-1)
+    np.testing.assert_allclose(norms_60, np.full(6, a_m), rtol=1e-5, atol=1e-4)
+
+    # Square lattice -> 4 nearest neighbors (+/- a_1, +/- a_2)
+    sq_lat = np.diag([100.0, 100.0])
+    vecs_sq = np.asarray(mcmc._make_moire_hop_vectors(sq_lat, ndim=2))
+    self.assertEqual(vecs_sq.shape, (4, 2))
+    np.testing.assert_allclose(
+        np.linalg.norm(vecs_sq, axis=-1), np.full(4, 100.0), rtol=1e-5
+    )
+
+  def test_interwell_pair_hop_moves_single_pair_by_lattice_vector_and_fixes_others(
+      self,
+  ):
+    """Inter-well pair hop moves exactly 1 matched pair by a lattice vector and fixes all other particles."""
+    a_m = 150.0
+    prim_lattice = geometry.triangular_lattice(a_m)
+    sim_lattice = geometry.supercell_lattice(prim_lattice, np.diag([6, 6]))
+    rec = 2.0 * jnp.pi * jnp.linalg.inv(sim_lattice)
+    map_to_cell = lambda p: mcmc.map_to_simulation_cell(p, sim_lattice, rec, 2)
+    dist_sq_fn = mcmc._make_minimum_image_dist_sq_fn(sim_lattice)
+    mic_disp_fn = geometry.make_minimum_image_distance_fn(sim_lattice)
+
+    batch_size = 512
+    n_e, n_h = 3, 3
+    nelec = n_e + n_h
+    pair_radius = 40.0
+
+    # Place 2 well-separated bound pairs (pair 0 at site (0,0), pair 1 at site (3,0))
+    # and 1 unpaired electron + 1 unpaired hole far apart (distance > pair_radius).
+    a1 = jnp.asarray(prim_lattice[:, 0])
+    a2 = jnp.asarray(prim_lattice[:, 1])
+    pos_h_single = jnp.stack([
+        0.1 * a1 + 0.1 * a2,
+        3.1 * a1 + 0.1 * a2,
+        0.1 * a1 + 3.1 * a2,
+    ], axis=0)
+    offsets = jnp.array([
+        [3.0, -2.0],
+        [-2.5, 4.0],
+        [80.0, 0.0],  # > pair_radius=40.0 so (e2, h2) are unpaired!
+    ])
+    pos_e_single = pos_h_single + offsets
+    x0 = map_to_cell(
+        jnp.broadcast_to(
+            jnp.reshape(
+                jnp.concatenate([pos_e_single, pos_h_single], axis=0), (1, -1)
+            ),
+            (batch_size, nelec * 2),
+        )
+    )
+    data = _make_dummy_data(x0, nelec)
+    flat_log_psi = lambda params, x, s, a, c: jnp.zeros((x.shape[0],))
+
+    (
+        new_data,
+        _,
+        _,
+        num_accepts,
+        num_map_rej,
+        total_pairs,
+        active_pair_tries,
+        active_pair_accepts,
+    ) = mcmc.mh_pair_update(
+        params={},
+        f=flat_log_psi,
+        data=data,
+        key=jax.random.PRNGKey(202611),
+        lp_1=jnp.zeros((batch_size,)),
+        num_accepts=0.0,
+        ndim=2,
+        map_to_cell=map_to_cell,
+        layer_counts=(n_e, n_h),
+        pair_radius=pair_radius,
+        dist_sq_fn=dist_sq_fn,
+        pair_lattice=prim_lattice,
+        return_pair_diagnostics=True,
+    )
+
+    self.assertEqual(int(num_accepts), batch_size)
+    self.assertEqual(int(num_map_rej), 0)
+    self.assertAlmostEqual(float(total_pairs) / batch_size, 2.0, places=5)
+    self.assertEqual(int(active_pair_tries), batch_size)
+    self.assertEqual(int(active_pair_accepts), batch_size)
+
+    pos_in = jnp.reshape(x0, (batch_size, nelec, 2))
+    pos_out = jnp.reshape(new_data.positions, (batch_size, nelec, 2))
+    # Unpaired electron (idx 2) and unpaired hole (idx 5) must be preserved bit-for-bit!
+    np.testing.assert_array_equal(pos_out[:, 2, :], pos_in[:, 2, :])
+    np.testing.assert_array_equal(pos_out[:, 5, :], pos_in[:, 5, :])
+
+    # In each walker, exactly ONE of pair 0 or pair 1 moved, while the other stayed fixed.
+    moved_e0 = jnp.any(jnp.abs(pos_out[:, 0, :] - pos_in[:, 0, :]) > 1e-4, axis=-1)
+    moved_e1 = jnp.any(jnp.abs(pos_out[:, 1, :] - pos_in[:, 1, :]) > 1e-4, axis=-1)
+    moved_h0 = jnp.any(jnp.abs(pos_out[:, 3, :] - pos_in[:, 3, :]) > 1e-4, axis=-1)
+    moved_h1 = jnp.any(jnp.abs(pos_out[:, 4, :] - pos_in[:, 4, :]) > 1e-4, axis=-1)
+    np.testing.assert_array_equal(moved_e0, moved_h0)
+    np.testing.assert_array_equal(moved_e1, moved_h1)
+    np.testing.assert_array_equal(moved_e0 ^ moved_e1, jnp.ones((batch_size,), dtype=bool))
+
+    # Both bound pairs must be selected ~50% of the time across the batch
+    frac_pair0 = float(jnp.mean(moved_e0.astype(jnp.float32)))
+    self.assertAlmostEqual(frac_pair0, 0.5, delta=0.07)
+
+    # The moved pair's MIC displacement must have norm == a_m and preserve r_e - r_h
+    disp_eh, _ = mic_disp_fn(pos_out[:, :2, :], pos_out[:, 3:5, :])
+    np.testing.assert_allclose(
+        disp_eh[:, 0, 0, :], jnp.broadcast_to(offsets[0], (batch_size, 2)), atol=1e-4
+    )
+    np.testing.assert_allclose(
+        disp_eh[:, 1, 1, :], jnp.broadcast_to(offsets[1], (batch_size, 2)), atol=1e-4
+    )
+
+    # Check that each hop displacement vector is one of the 6 nearest-neighbor moire vectors
+    hop_vecs = np.asarray(mcmc._make_moire_hop_vectors(prim_lattice, ndim=2))
+    disp_e0, _ = mic_disp_fn(pos_out[:, 0:1, :], pos_in[:, 0:1, :])
+    disp_e1, _ = mic_disp_fn(pos_out[:, 1:2, :], pos_in[:, 1:2, :])
+    actual_hops = np.where(
+        np.asarray(moved_e0)[:, None],
+        np.asarray(disp_e0[:, 0, 0, :]),
+        np.asarray(disp_e1[:, 0, 0, :]),
+    )
+    hop_norms = np.linalg.norm(actual_hops, axis=-1)
+    np.testing.assert_allclose(hop_norms, np.full(batch_size, a_m), rtol=1e-4, atol=1e-3)
+    for b in range(batch_size):
+      dists = np.linalg.norm(hop_vecs - actual_hops[b][None, :], axis=-1)
+      self.assertLess(float(np.min(dists)), 1e-2)
+
+  def test_interwell_pair_hop_detailed_balance_and_moire_well_equilibration(
+      self,
+  ):
+    """50/50 ordinary local + pair inter-well hopping crosses deep moire barriers and samples exact well weights."""
+    a_m = 150.0
+    prim_lattice = geometry.triangular_lattice(a_m)
+    sim_lattice = geometry.supercell_lattice(prim_lattice, np.diag([3, 1]))
+    mic_disp_fn = geometry.make_minimum_image_distance_fn(sim_lattice)
+
+    # 3 moire wells along a_1 at 0*a_1, 1*a_1, 2*a_1 with deep confinement
+    # (sigma_well = 3.0 Bohr << a_M = 150.0 Bohr) and unequal target weights
+    # p_0 : p_1 : p_2 = 0.2 : 0.5 : 0.3.
+    a1 = jnp.asarray(prim_lattice[:, 0])
+    a2 = jnp.asarray(prim_lattice[:, 1])
+    well_centers = jnp.stack([
+        0.5 * a2,
+        1.0 * a1 + 0.5 * a2,
+        2.0 * a1 + 0.5 * a2,
+    ], axis=0)  # (3, 2)
+    target_probs = jnp.array([0.2, 0.5, 0.3])
+    log_weights = 0.5 * jnp.log(target_probs)  # log|psi| weights
+    sigma_well = 3.0
+    sigma_bind = 1.0
+
+    def log_psi(params, x, spins, atoms, charges):
+      del params, spins, atoms, charges
+      pos = jnp.reshape(x, (-1, 2, 2))
+      r_e = pos[:, 0:1, :]  # (batch, 1, 2)
+      r_h = pos[:, 1:2, :]  # (batch, 1, 2)
+      _, r_eh = mic_disp_fn(r_e, r_h)  # (batch, 1, 1)
+      r_rel_sq = r_eh[:, 0, 0] ** 2
+      _, dist_to_wells = mic_disp_fn(
+          r_h, jnp.broadcast_to(well_centers[None, ...], (pos.shape[0], 3, 2))
+      )  # (batch, 1, 3)
+      d_well_sq = dist_to_wells[:, 0, :] ** 2  # (batch, 3)
+      log_well_terms = log_weights[None, :] - 0.25 * d_well_sq / (sigma_well**2)
+      log_well = jax.scipy.special.logsumexp(log_well_terms, axis=-1)
+      log_bind = -0.25 * r_rel_sq / (sigma_bind**2)
+      return log_well + log_bind
+
+    # Initialize all walkers in Well 0 with zero e-h separation
+    batch_size = 512
+    r_h0 = jnp.broadcast_to(well_centers[0][None, :], (batch_size, 2))
+    r_e0 = r_h0
+    x0 = jnp.reshape(jnp.stack([r_e0, r_h0], axis=1), (batch_size, 4))
+    data0 = _make_dummy_data(x0, 2)
+
+    # Local move width sigma_n = 1.5 Bohr (~ 1% of a_M)
+    step_ordinary_only = jax.jit(
+        mcmc.make_mcmc_step(
+            log_psi,
+            batch_per_device=batch_size,
+            steps=60,
+            ndim=2,
+            lattice=sim_lattice,
+            nspins=(1, 1),
+            pair_prob=0.0,
+        )
+    )
+    step_interwell = jax.jit(
+        mcmc.make_mcmc_step(
+            log_psi,
+            batch_per_device=batch_size,
+            steps=60,
+            ndim=2,
+            lattice=sim_lattice,
+            nspins=(1, 1),
+            pair_prob=0.5,
+            pair_radius=30.0,
+            pair_min_fraction=0.0,
+            pair_lattice=prim_lattice,
+            return_stats=True,
+        )
+    )
+
+    key = jax.random.PRNGKey(20261108)
+    k1, k2 = jax.random.split(key)
+    data_ord, _ = step_ordinary_only({}, data0, k1, jnp.asarray(1.5))
+    data_hop, stats_hop = step_interwell(
+        {}, data0, k2, jnp.array([1.5, a_m, 1.0])
+    )
+
+    pos_ord = jnp.reshape(data_ord.positions, (batch_size, 2, 2))
+    pos_hop = jnp.reshape(data_hop.positions, (batch_size, 2, 2))
+
+    _, d_ord = mic_disp_fn(
+        pos_ord[:, 1:2, :],
+        jnp.broadcast_to(well_centers[None, ...], (batch_size, 3, 2)),
+    )
+    well_idx_ord = jnp.argmin(d_ord[:, 0, :], axis=-1)
+    # Ordinary single-particle MCMC is 100% trapped in Well 0
+    self.assertEqual(float(jnp.mean(well_idx_ord == 0)), 1.0)
+
+    _, d_hop = mic_disp_fn(
+        pos_hop[:, 1:2, :],
+        jnp.broadcast_to(well_centers[None, ...], (batch_size, 3, 2)),
+    )
+    well_idx_hop = jnp.argmin(d_hop[:, 0, :], axis=-1)
+    for w_idx, expected_p in enumerate([0.2, 0.5, 0.3]):
+      measured_p = float(jnp.mean(well_idx_hop == w_idx))
+      self.assertAlmostEqual(measured_p, expected_p, delta=0.06)
+
+    # Also verify internal relative coordinate equilibrated inside wells
+    disp_rel, _ = mic_disp_fn(pos_hop[:, 0:1, :], pos_hop[:, 1:2, :])
+    rel_var = float(jnp.var(disp_rel[:, 0, 0, :]))
+    self.assertAlmostEqual(rel_var, sigma_bind**2, delta=0.12)
+    self.assertGreater(float(stats_hop['n_acc_pair']), 0.0)
+
+  def test_interwell_pair_hop_rejects_occupied_well_collision_and_keeps_pair_width_fixed(
+      self,
+  ):
+    """Hopping into an occupied well that alters pairing map is rejected; pair width stays fixed."""
+    a_m = 150.0
+    prim_lattice = geometry.triangular_lattice(a_m)
+    sim_lattice = geometry.supercell_lattice(prim_lattice, np.diag([4, 4]))
+    rec = 2.0 * jnp.pi * jnp.linalg.inv(sim_lattice)
+    map_to_cell = lambda p: mcmc.map_to_simulation_cell(p, sim_lattice, rec, 2)
+    dist_sq_fn = mcmc._make_minimum_image_dist_sq_fn(sim_lattice)
+
+    # Set up 1 bound pair (e0, h0) at well (0, 0) with separation 10.0 < pair_radius=20.0,
+    # and surround well (0, 0) at all 6 neighboring moire lattice sites with unpaired
+    # holes at offset (2.0, 0.0) so any hop of (e0, h0) by a nearest-neighbor
+    # moire vector lands e0 within distance 2.0 < 10.0 of another hole, changing
+    # partner_h_2[0] and triggering a 100% pairing-map rejection!
+    hop_vecs = mcmc._make_moire_hop_vectors(prim_lattice, ndim=2)  # (6, 2)
+    batch_size = 64
+    n_e, n_h = 1, 7
+    nelec = n_e + n_h
+    pair_radius = 20.0
+
+    pos_e0 = jnp.array([[50.0, 50.0]])  # (1, 2)
+    pos_h0 = jnp.array([[60.0, 50.0]])  # distance 10.0 to e0
+    pos_h_neighbors = pos_e0 + hop_vecs + jnp.array([[2.0, 0.0]])  # (6, 2)
+    pos_h_all = jnp.concatenate([pos_h0, pos_h_neighbors], axis=0)  # (7, 2)
+    x0 = map_to_cell(
+        jnp.broadcast_to(
+            jnp.reshape(jnp.concatenate([pos_e0, pos_h_all], axis=0), (1, -1)),
+            (batch_size, nelec * 2),
+        )
+    )
+    data = _make_dummy_data(x0, nelec)
+    huge_reward_log_psi = lambda params, x, s, a, c: 100.0 * jnp.ones((x.shape[0],))
+
+    (
+        new_data,
+        _,
+        _,
+        num_accepts,
+        num_map_rej,
+        _,
+        active_pair_tries,
+        active_pair_accepts,
+    ) = mcmc.mh_pair_interwell_update(
+        params={},
+        f=huge_reward_log_psi,
+        data=data,
+        key=jax.random.PRNGKey(909),
+        lp_1=jnp.zeros((batch_size,)),
+        num_accepts=0.0,
+        pair_lattice=prim_lattice,
+        ndim=2,
+        map_to_cell=map_to_cell,
+        layer_counts=(n_e, n_h),
+        pair_radius=pair_radius,
+        dist_sq_fn=dist_sq_fn,
+        return_pair_diagnostics=True,
+    )
+    self.assertEqual(int(num_accepts), 0)
+    self.assertEqual(int(num_map_rej), batch_size)
+    self.assertEqual(int(active_pair_tries), 0)
+    self.assertEqual(int(active_pair_accepts), 0)
+    np.testing.assert_array_equal(new_data.positions, x0)
+
+    # Verify that with adapt_pair_width=False (inter-well mode), width_pair stays
+    # fixed at a_m while width_normal adapts normally.
+    adapt_freq = 4
+    w_state = mcmc.init_pair_mcmc_width(
+        2.0,
+        pair_min_fraction=0.0,
+        pair_moves_enabled=True,
+        pair_hop_distance=a_m,
+    )[None, :]
+    adapt_state = mcmc.init_pair_mcmc_adaptation_state(
+        adapt_freq, pair_moves_enabled=True, adapt_pair_width=False
+    )
+    fake_low_pair_acc_stats = {
+        'n_try_normal': jnp.array([100.0]),
+        'n_acc_normal': jnp.array([20.0]),  # < 0.50 -> shrink width_normal
+        'n_try_pair': jnp.array([100.0]),
+        'n_acc_pair': jnp.array([5.0]),
+        'n_try_pair_active': jnp.array([80.0]),
+        'n_acc_pair_active': jnp.array([5.0]),  # 6.25% acceptance
+    }
+    for t in range(1, adapt_freq + 1):
+      w_state, adapt_state = mcmc.update_pair_mcmc_widths(
+          t, w_state, adapt_freq, fake_low_pair_acc_stats, adapt_state
+      )
+    self.assertAlmostEqual(float(w_state[0, 0]), 2.0 / 1.1, places=5)
+    self.assertAlmostEqual(float(w_state[0, 1]), a_m, places=5)
+
+  def test_custom_hop_vectors_validation_rejects_asymmetric_or_invalid_inputs(
+      self,
+  ):
+    """Custom hop_vectors must be finite, non-zero, 2D, and negation-symmetric."""
+    flat_log_psi = lambda params, x, s, a, c: jnp.zeros((x.shape[0],))
+    data = _make_dummy_data(jnp.zeros((4, 4)), 2)
+
+    invalid_hop_vectors = [
+        np.zeros((0, 2)),  # empty
+        np.array([150.0, 0.0]),  # 1D instead of 2D
+        np.array([[150.0, 0.0, 0.0], [-150.0, 0.0, 0.0]]),  # wrong ndim
+        np.array([[0.0, 0.0], [0.0, 0.0]]),  # zero vectors
+        np.array([[150.0, np.nan], [-150.0, 0.0]]),  # non-finite (NaN)
+        np.array([[150.0, np.inf], [-150.0, -np.inf]]),  # non-finite (Inf)
+        np.array([[150.0, 0.0]]),  # single forward vector without -a
+        np.array([[150.0, 0.0], [0.0, 150.0]]),  # two forward vectors without -a
+        np.array([
+            [150.0, 0.0],
+            [150.0, 0.0],
+            [-150.0, 0.0],
+        ]),  # unequal multiplicity (2x +a vs 1x -a)
+        np.array([
+            [150.0, 0.0],
+            [150.0, 0.0],
+            [-150.0, 0.0],
+            [0.0, 150.0],
+        ]),  # even count but unequal multiplicity
+    ]
+    for bad_vecs in invalid_hop_vectors:
+      with self.assertRaises(ValueError):
+        mcmc._validate_hop_vectors(bad_vecs, ndim=2)
+      with self.assertRaises(ValueError):
+        mcmc.mh_pair_interwell_update(
+            params={},
+            f=flat_log_psi,
+            data=data,
+            key=jax.random.PRNGKey(0),
+            lp_1=jnp.zeros((4,)),
+            num_accepts=0.0,
+            hop_vectors=bad_vecs,
+            ndim=2,
+            layer_counts=(1, 1),
+            pair_radius=10.0,
+        )
+      with self.assertRaises(ValueError):
+        mcmc.make_mcmc_step(
+            flat_log_psi,
+            batch_per_device=4,
+            steps=2,
+            ndim=2,
+            nspins=(1, 1),
+            pair_prob=0.5,
+            pair_radius=10.0,
+            hop_vectors=bad_vecs,
+        )
+
+    # Valid symmetric set (including weighted multiplicity with matching +/- pairs)
+    valid_vecs = np.array([
+        [150.0, 0.0],
+        [-150.0, 0.0],
+        [150.0, 0.0],
+        [-150.0, 0.0],
+        [0.0, 150.0],
+        [0.0, -150.0],
+    ])
+    validated = mcmc._validate_hop_vectors(valid_vecs, ndim=2)
+    self.assertEqual(validated.shape, (6, 2))
+
+  def test_interwell_pair_hop_zero_pairs_and_periodic_identity_avoid_wrapping_roundoff(
+      self,
+  ):
+    """Zero-pair walkers and periodic identity translations never cause false acceptances from wrapping roundoff."""
+    a_m = 151.18
+    prim_lattice = geometry.triangular_lattice(a_m)
+    sim_lattice = geometry.supercell_lattice(prim_lattice, np.diag([3, 3]))
+    rec = 2.0 * jnp.pi * jnp.linalg.inv(sim_lattice)
+    map_to_cell = lambda p: mcmc.map_to_simulation_cell(p, sim_lattice, rec, 2)
+    dist_sq_fn = mcmc._make_minimum_image_dist_sq_fn(sim_lattice)
+
+    batch_size = 4096
+    n_e, n_h = 1, 1
+    nelec = 2
+    pair_radius = 25.0
+
+    # Construct 4,096 already-wrapped walkers with 0 matched pairs (e-h distance ~ 150 > 25),
+    # where re-applying map_to_cell(x1) produces float32 ULP roundoff differences on >1,000 walkers.
+    key = jax.random.PRNGKey(20261109)
+    u = jax.random.uniform(key, (batch_size, 2), dtype=jnp.float32)
+    r_e = u @ jnp.asarray(sim_lattice.T, dtype=jnp.float32)
+    r_h = r_e + jnp.asarray(prim_lattice[:, 0], dtype=jnp.float32)[None, :]
+    x1 = map_to_cell(jnp.concatenate([r_e, r_h], axis=-1))
+    # Confirm that re-wrapping x1 in float32 changes coordinates on many walkers:
+    rewrap_diff_walkers = int(jnp.sum(jnp.any(map_to_cell(x1) != x1, axis=-1)))
+    self.assertGreater(rewrap_diff_walkers, 100)
+
+    data_unpaired = _make_dummy_data(x1, nelec)
+    huge_reward_log_psi = lambda params, x, s, a, c: 100.0 * jnp.ones((x.shape[0],))
+
+    (
+        new_data,
+        _,
+        _,
+        num_accepts,
+        num_map_rej,
+        total_pairs,
+        active_pair_tries,
+        active_pair_accepts,
+    ) = mcmc.mh_pair_interwell_update(
+        params={},
+        f=huge_reward_log_psi,
+        data=data_unpaired,
+        key=jax.random.PRNGKey(1234),
+        lp_1=jnp.zeros((batch_size,)),
+        num_accepts=0.0,
+        pair_lattice=prim_lattice,
+        ndim=2,
+        map_to_cell=map_to_cell,
+        layer_counts=(n_e, n_h),
+        pair_radius=pair_radius,
+        dist_sq_fn=dist_sq_fn,
+        return_pair_diagnostics=True,
+    )
+    self.assertEqual(float(total_pairs), 0.0)
+    self.assertEqual(int(active_pair_tries), 0)
+    self.assertEqual(int(active_pair_accepts), 0)
+    self.assertEqual(int(num_accepts), 0)
+    self.assertEqual(int(num_map_rej), 0)
+    np.testing.assert_array_equal(new_data.positions, x1)
+
+    # Now test periodic identity hop on walkers WITH 1 bound pair (e-h distance = 1.0 < 25.0),
+    # when hop_vectors are supercell lattice vectors (+/- L_1) that wrap back to the same point
+    # up to float32 roundoff.
+    r_h_paired = r_e + jnp.array([[1.0, -0.5]], dtype=jnp.float32)
+    x1_paired = map_to_cell(jnp.concatenate([r_e, r_h_paired], axis=-1))
+    data_paired = _make_dummy_data(x1_paired, nelec)
+    supercell_hop_vecs = jnp.stack(
+        [
+            jnp.asarray(sim_lattice[:, 0], dtype=jnp.float32),
+            -jnp.asarray(sim_lattice[:, 0], dtype=jnp.float32),
+        ],
+        axis=0,
+    )
+    (
+        new_data_id,
+        _,
+        _,
+        num_accepts_id,
+        num_map_rej_id,
+        total_pairs_id,
+        active_pair_tries_id,
+        active_pair_accepts_id,
+    ) = mcmc.mh_pair_interwell_update(
+        params={},
+        f=huge_reward_log_psi,
+        data=data_paired,
+        key=jax.random.PRNGKey(5678),
+        lp_1=jnp.zeros((batch_size,)),
+        num_accepts=0.0,
+        hop_vectors=supercell_hop_vecs,
+        ndim=2,
+        map_to_cell=map_to_cell,
+        layer_counts=(n_e, n_h),
+        pair_radius=pair_radius,
+        dist_sq_fn=dist_sq_fn,
+        return_pair_diagnostics=True,
+    )
+    self.assertEqual(float(total_pairs_id), float(batch_size))
+    self.assertEqual(int(active_pair_tries_id), 0)
+    self.assertEqual(int(active_pair_accepts_id), 0)
+    self.assertEqual(int(num_accepts_id), 0)
+    self.assertEqual(int(num_map_rej_id), 0)
+    np.testing.assert_array_equal(new_data_id.positions, x1_paired)
+
 
 if __name__ == '__main__':
   absltest.main()

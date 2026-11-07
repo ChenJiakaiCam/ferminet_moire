@@ -738,6 +738,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         'pmove_pair',
         'pmove_pair_active',
         'pair_map_reject_rate',
+        'pair_mh_reject_rate',
         'mean_num_pairs',
         'width_normal',
         'width_pair',
@@ -835,8 +836,9 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   atoms_to_mcmc = atoms if cfg.mcmc.scale_by_nuclear_distance else None
   pair_prob = float(cfg.mcmc.get('pair_prob', 0.0))
   pair_radius = float(cfg.mcmc.get('pair_radius', 0.0))
+  pair_lattice = cfg.mcmc.get('pair_lattice', None)
+  moire_cfg = cfg.system.get('moire')
   if pair_prob > 0.0 and pair_radius <= 0.0:
-    moire_cfg = cfg.system.get('moire')
     interlayer_d = 0.0
     if (
         moire_cfg is not None
@@ -849,6 +851,30 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
       )
     if interlayer_d > 0.0:
       pair_radius = 1.5 * interlayer_d
+  if pair_prob > 0.0 and pair_lattice is None:
+    if 'moire_lattice' in cfg.system.make_local_energy_kwargs:
+      pair_lattice = np.asarray(
+          cfg.system.make_local_energy_kwargs['moire_lattice'],
+          dtype=np.float64,
+      )
+    elif moire_cfg is not None:
+      if moire_cfg.get('primitive_lattice') is not None:
+        pair_lattice = np.asarray(
+            moire_cfg.primitive_lattice, dtype=np.float64
+        )
+      elif moire_cfg.get('lattice_constant') is not None:
+        from ferminet.moire import geometry as moire_geometry  # pylint: disable=g-import-not-at-top
+        pair_lattice = moire_geometry.triangular_lattice(
+            float(moire_cfg.lattice_constant)
+        )
+    elif (
+        cfg.network.get('make_feature_layer_kwargs')
+        and 'primitive_lattice' in cfg.network.make_feature_layer_kwargs
+    ):
+      pair_lattice = np.asarray(
+          cfg.network.make_feature_layer_kwargs['primitive_lattice'],
+          dtype=np.float64,
+      )
   mcmc_step = mcmc.make_mcmc_step(
       batch_network,
       device_batch_size,
@@ -862,6 +888,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
       pair_radius=pair_radius,
       pair_width_scale=pair_width_scale,
       pair_min_fraction=pair_min_fraction,
+      pair_lattice=pair_lattice,
       return_stats=use_pair_mcmc,
   )
 
@@ -1037,25 +1064,81 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
 
   if use_pair_mcmc:
     is_inference = cfg.optim.optimizer == 'none'
+    use_interwell_pair_hops = pair_lattice is not None
+    pair_hop_distance = (
+        float(
+            jnp.linalg.norm(
+                mcmc._make_moire_hop_vectors(
+                    pair_lattice, ndim=cfg.system.ndim
+                )[0]
+            )
+        )
+        if use_interwell_pair_hops
+        else None
+    )
     if mcmc_width_ckpt is not None:
+      dist_sq_fn_ckpt = mcmc._make_minimum_image_dist_sq_fn(cfg.system.lattice)
+      nelec_mcmc = n_e_mcmc + n_h_mcmc
+      pos_ckpt_3d = jnp.reshape(
+          data.positions, [-1, nelec_mcmc, cfg.system.ndim]
+      )
+      _, is_paired_ckpt = mcmc._find_mutual_eh_pairs(
+          pos_ckpt_3d[:, :n_e_mcmc, :],
+          pos_ckpt_3d[:, n_e_mcmc:, :],
+          pair_radius,
+          dist_sq_fn_ckpt,
+      )
+      ckpt_mean_pairs = float(
+          jnp.mean(jnp.sum(is_paired_ckpt.astype(jnp.float32), axis=-1))
+      )
+      ckpt_meets_pair_threshold = ckpt_mean_pairs >= (
+          pair_min_fraction * float(min(n_e_mcmc, n_h_mcmc))
+      )
       w_ckpt = jnp.asarray(mcmc_width_ckpt[0], dtype=jnp.float32)
       if w_ckpt.ndim == 0:
-        init_enabled = 1.0 if (is_inference or pair_min_fraction <= 0.0) else 0.0
+        init_enabled = (
+            1.0
+            if (
+                is_inference
+                or pair_min_fraction <= 0.0
+                or ckpt_meets_pair_threshold
+            )
+            else 0.0
+        )
+        wp_init = (
+            pair_hop_distance
+            if pair_hop_distance is not None
+            else w_ckpt * pair_width_scale
+        )
         w_init = jnp.asarray(
-            [w_ckpt, w_ckpt * pair_width_scale, init_enabled], dtype=jnp.float32
+            [w_ckpt, wp_init, init_enabled], dtype=jnp.float32
         )
       elif w_ckpt.shape[-1] == 2:
         init_enabled = (
             1.0
-            if (is_inference or pair_min_fraction <= 0.0 or t_init > 0)
+            if (
+                is_inference
+                or pair_min_fraction <= 0.0
+                or ckpt_meets_pair_threshold
+                or t_init > 0
+            )
             else 0.0
         )
+        wp_init = (
+            pair_hop_distance if pair_hop_distance is not None else w_ckpt[1]
+        )
         w_init = jnp.asarray(
-            [w_ckpt[0], w_ckpt[1], init_enabled], dtype=jnp.float32
+            [w_ckpt[0], wp_init, init_enabled], dtype=jnp.float32
         )
       else:
         w_init = w_ckpt
-        if is_inference or pair_min_fraction <= 0.0:
+        if pair_hop_distance is not None:
+          w_init = w_init.at[1].set(pair_hop_distance)
+        if (
+            is_inference
+            or pair_min_fraction <= 0.0
+            or ckpt_meets_pair_threshold
+        ):
           w_init = w_init.at[-1].set(1.0)
       mcmc_width = kfac_jax.utils.replicate_all_local_devices(w_init)
     else:
@@ -1064,11 +1147,13 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
           pair_width_scale=pair_width_scale,
           pair_min_fraction=pair_min_fraction,
           pair_moves_enabled=(is_inference or pair_min_fraction <= 0.0),
+          pair_hop_distance=pair_hop_distance,
       )
       mcmc_width = kfac_jax.utils.replicate_all_local_devices(w_init)
     pair_adapt_state = mcmc.init_pair_mcmc_adaptation_state(
         cfg.mcmc.adapt_frequency,
         pair_moves_enabled=bool(np.asarray(w_init[-1]) > 0.5),
+        adapt_pair_width=(not use_interwell_pair_hops),
     )
     pmoves = None
   else:
@@ -1170,6 +1255,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         pmove_pair = mcmc_stats['pmove_pair'][0]
         pmove_pair_active = mcmc_stats['pmove_pair_active'][0]
         pair_map_reject_rate = mcmc_stats['pair_map_reject_rate'][0]
+        pair_mh_reject_rate = mcmc_stats['pair_mh_reject_rate'][0]
         mean_num_pairs = mcmc_stats['mean_num_pairs'][0]
       else:
         mcmc_stats = None
@@ -1194,6 +1280,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
             mcmc_stats,  # pyrefly: ignore[bad-argument-type]
             pair_adapt_state,  # pyrefly: ignore[bad-argument-type]
             freeze_pair_schedule=(cfg.optim.optimizer == 'none'),
+            adapt_pair_width=(not use_interwell_pair_hops),  # pyrefly: ignore[unbound-name]
         )
       else:
         mcmc_width, pmoves = mcmc.update_mcmc_width(
@@ -1231,13 +1318,15 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
           width_pair_val = np.asarray(mcmc_width[0, 1])
           logging_str += (
               ', pmove_n=%0.2f, pmove_p=%0.2f, pmove_p_act=%0.2f, '
-              'map_rej=%0.2f, pairs=%0.2f, width_n=%0.3f, width_p=%0.3f'
+              'map_rej=%0.2f, mh_rej=%0.2f, pairs=%0.2f, '
+              'width_n=%0.3f, width_p=%0.3f'
           )
           logging_args += (
               pmove_normal,  # pyrefly: ignore[unbound-name]
               pmove_pair,  # pyrefly: ignore[unbound-name]
               pmove_pair_active,  # pyrefly: ignore[unbound-name]
               pair_map_reject_rate,  # pyrefly: ignore[unbound-name]
+              pair_mh_reject_rate,  # pyrefly: ignore[unbound-name]
               mean_num_pairs,  # pyrefly: ignore[unbound-name]
               width_normal_val,
               width_pair_val,
@@ -1247,6 +1336,9 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
           writer_kwargs['pmove_pair_active'] = np.asarray(pmove_pair_active)  # pyrefly: ignore[unbound-name]
           writer_kwargs['pair_map_reject_rate'] = np.asarray(
               pair_map_reject_rate  # pyrefly: ignore[unbound-name]
+          )
+          writer_kwargs['pair_mh_reject_rate'] = np.asarray(
+              pair_mh_reject_rate  # pyrefly: ignore[unbound-name]
           )
           writer_kwargs['mean_num_pairs'] = np.asarray(mean_num_pairs)  # pyrefly: ignore[unbound-name]
           writer_kwargs['width_normal'] = width_normal_val

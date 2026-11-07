@@ -394,6 +394,395 @@ def _find_mutual_eh_pairs(
   return partner_h_for_e, is_paired_e  # partner_h_for_e shaped (batch, n_e), gives the index of the paired hole for each electron, or -1 if unpaired. is_paired_e shaped (batch, n_e), gives True if electron is paired, False otherwise.
 
 
+def _make_moire_hop_vectors(
+    pair_lattice: jnp.ndarray | np.ndarray,
+    ndim: int = 2,
+) -> jnp.ndarray:
+  """Constructs nearest-neighbor direct lattice translation vectors for inter-well hops.
+
+  Given a primitive moire lattice matrix `pair_lattice` of shape `(ndim, ndim)`
+  whose columns are the primitive lattice vectors:
+    1. LLL-reduces the basis so the basis vectors lie in the first shell.
+    2. Enumerates all non-zero integer combinations `n in {-1, 0, 1}^ndim \\ {0}`
+       and retains the shortest-shell vectors (within relative tolerance 1e-4 of
+       the shortest non-zero lattice vector, plus all unit basis vectors
+       `+/- a_k` so anisotropic/rectangular lattices span every axis).
+
+  For a 2D triangular moire lattice (either 120-degree or 60-degree basis), this
+  returns the exact 6 nearest-neighbor moire lattice vectors of length `a_M`
+  (`{+/- a_1, +/- a_2, +/-(a_1 + a_2)}` or `{+/- a_1, +/- a_2, +/-(a_2 - a_1)}`).
+  Because both the L1 integer norm and Euclidean vector norm are invariant under
+  `n -> -n`, opposite directions `+a` and `-a` are always included in pairs and
+  sampled with equal probability.
+
+  Args:
+    pair_lattice: Shape `(ndim, ndim)` matrix with direct lattice vectors as
+      columns.
+    ndim: Spatial dimensionality.
+
+  Returns:
+    Float32 JAX array of shape `(n_vectors, ndim)` containing the nearest-neighbor
+    lattice translation vectors as rows.
+  """
+  lat_np = np.asarray(pair_lattice, dtype=np.float64)
+  if lat_np.shape != (ndim, ndim):
+    raise ValueError(
+        f'pair_lattice must have shape ({ndim}, {ndim}), got {lat_np.shape}.'
+    )
+  if not np.all(np.isfinite(lat_np)):
+    raise ValueError('pair_lattice must have finite entries.')
+  if abs(np.linalg.det(lat_np)) <= 1e-12:
+    raise ValueError('pair_lattice must be non-singular.')
+
+  reduced_np = _lll_reduced_basis(lat_np)
+  grid = np.meshgrid(
+      *[np.array([-1, 0, 1], dtype=np.int64) for _ in range(ndim)],
+      indexing='ij',
+  )
+  point_list = np.stack([g.ravel() for g in grid], axis=-1)
+  nonzero_mask = np.any(point_list != 0, axis=-1)
+  point_list = point_list[nonzero_mask]
+
+  candidates = point_list @ reduced_np.T  # (3^ndim - 1, ndim)
+  norms = np.linalg.norm(candidates, axis=-1)
+  min_norm = float(np.min(norms))
+  is_basis_axis = np.sum(np.abs(point_list), axis=-1) == 1
+  is_first_shell = norms <= min_norm * (1.0 + 1e-4)
+  keep_mask = is_basis_axis | is_first_shell
+  hop_vectors_np = candidates[keep_mask]
+  return jnp.asarray(hop_vectors_np, dtype=jnp.float32)
+
+
+def _validate_hop_vectors(
+    hop_vectors: jnp.ndarray | np.ndarray,
+    ndim: int = 2,
+    atol: float = 1e-5,
+) -> jnp.ndarray:
+  """Validates custom hop vectors for shape, finiteness, and +/- symmetry.
+
+  To preserve detailed balance without a Hastings proposal-ratio correction,
+  every hop vector `+a` must appear with the exact same multiplicity as its
+  reverse `-a` (and be non-zero and finite).
+
+  Args:
+    hop_vectors: Array of shape `(n_vectors, ndim)`.
+    ndim: Spatial dimensionality.
+    atol: Tolerance for matching opposite vectors `+a` and `-a`.
+
+  Returns:
+    Validated `jnp.float32` array of shape `(n_vectors, ndim)`.
+  """
+  if isinstance(hop_vectors, jax.core.Tracer):
+    if hop_vectors.ndim != 2 or hop_vectors.shape[1] != ndim or hop_vectors.shape[0] == 0:
+      raise ValueError(
+          f'hop_vectors must have shape (n_vectors >= 1, {ndim}), got '
+          f'{hop_vectors.shape}.'
+      )
+    return jnp.asarray(hop_vectors, dtype=jnp.float32)
+
+  vecs_np = np.asarray(hop_vectors, dtype=np.float64)
+  if vecs_np.ndim != 2 or vecs_np.shape[1] != ndim or vecs_np.shape[0] == 0:
+    raise ValueError(
+        f'hop_vectors must have shape (n_vectors >= 1, {ndim}), got '
+        f'{vecs_np.shape}.'
+    )
+  if not np.all(np.isfinite(vecs_np)):
+    raise ValueError('hop_vectors must contain only finite values.')
+  norms = np.linalg.norm(vecs_np, axis=-1)
+  if np.any(norms <= atol):
+    raise ValueError(
+        f'hop_vectors must all be non-zero (norm > {atol}), got min norm '
+        f'{float(np.min(norms)):.3e}.'
+    )
+  n_vecs = vecs_np.shape[0]
+  matched = np.zeros(n_vecs, dtype=bool)
+  for idx in range(n_vecs):
+    if matched[idx]:
+      continue
+    v = vecs_np[idx]
+    tol = atol * max(1.0, float(norms[idx]))
+    partner_idx = -1
+    for jdx in range(idx + 1, n_vecs):
+      if not matched[jdx] and np.linalg.norm(v + vecs_np[jdx]) <= tol:
+        partner_idx = jdx
+        break
+    if partner_idx < 0:
+      raise ValueError(
+          'hop_vectors must be symmetric under negation (+a and -a with '
+          f'equal multiplicity); no unmatched opposite vector found for '
+          f'hop_vectors[{idx}] = {v.tolist()}.'
+      )
+    matched[idx] = True
+    matched[partner_idx] = True
+  return jnp.asarray(vecs_np, dtype=jnp.float32)
+
+
+def _mh_pair_interwell_update_with_diagnostics(
+    params: networks.ParamTree,
+    f: networks.LogFermiNetLike | Callable[..., jnp.ndarray],
+    data: networks.FermiNetData,
+    key: chex.PRNGKey,
+    lp_1: Any,
+    num_accepts: Any,
+    hop_vectors: jnp.ndarray,
+    atoms: Any = None,
+    ndim: int = 2,
+    map_to_cell: Callable[[jnp.ndarray], jnp.ndarray] = lambda x: x,
+    blocks: int = 1,
+    i: int | jnp.ndarray = 0,
+    layer_counts: tuple[int, int] = (0, 0),
+    pair_radius: float = 0.0,
+    dist_sq_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray] | None = None,
+) -> tuple[
+    networks.FermiNetData,
+    chex.PRNGKey,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+    jnp.ndarray,
+]:
+  """Internal single-pair inter-well lattice-hop MH update with diagnostics.
+
+  For each walker in the batch:
+    1. Identifies all mutual nearest-neighbor (e, h) pairs within `pair_radius`
+       under minimum-image distance (`_find_mutual_eh_pairs`).
+    2. Selects ONE matched pair `(i*, j*)` uniformly at random among the
+       `K(X)` mutual pairs currently present in the walker (and active state if
+       `num_states > 1`).
+    3. Selects ONE nearest-neighbor moire lattice translation vector `a`
+       uniformly at random from `hop_vectors` (where `+a` and `-a` have equal
+       probability).
+    4. Proposes `r_e[i*]' = r_e[i*] + a` and `r_h[j*]' = r_h[j*] + a`, leaving
+       all other `N_e + N_h - 2` particles strictly fixed, and wraps positions
+       into the simulation cell via `map_to_cell`.
+    5. Recomputes the mutual nearest-neighbor pairing map on `X'` and requires
+       exact pairing-map preservation (`partner_h_2 == partner_h_1`). Because
+       `partner_h_2 == partner_h_1` implies `K(X') = K(X)` and `(i*, j*)`
+       remains a mutual pair in `X'`, the reverse move `X' -> X` selects the
+       same pair `(i*, j*)` with probability `1 / K(X)` and the opposite lattice
+       vector `-a` with probability `1 / len(hop_vectors)`, ensuring exact
+       proposal symmetry `q(X' | X) = q(X | X')` and standard Metropolis
+       acceptance `min(1, |Psi(X')|^2 / |Psi(X)|^2)`.
+  """
+  if atoms is not None:
+    raise NotImplementedError(
+        'Asymmetric nuclear-distance scaling is not supported for pair moves.'
+    )
+  n_e, n_h = layer_counts
+  if dist_sq_fn is None:
+    dist_sq_fn = _make_minimum_image_dist_sq_fn(None)
+
+  key, subkey_pair, subkey_vec = jax.random.split(key, 3)
+  x1 = data.positions
+  batch_size = x1.shape[0]
+  nelec = n_e + n_h
+  num_states = max(1, x1.shape[1] // (nelec * ndim))
+  total_states = batch_size * num_states
+
+  pos_1 = jnp.reshape(x1, [total_states, nelec, ndim])
+  pos_e_1 = pos_1[:, :n_e, :]
+  pos_h_1 = pos_1[:, n_e:, :]
+
+  partner_h_1, is_paired_e_1 = _find_mutual_eh_pairs(
+      pos_e_1, pos_h_1, pair_radius, dist_sq_fn
+  )
+
+  if blocks > 1 and num_states > 1:
+    blocks_per_state = max(1, blocks // num_states)
+    ii = i % blocks
+    s_active = (ii // blocks_per_state) % num_states
+    state_idx = jnp.tile(jnp.arange(num_states), batch_size)[:, None]
+    active_state_mask = state_idx == s_active
+    active_paired_e = is_paired_e_1 & active_state_mask
+  else:
+    active_paired_e = is_paired_e_1
+
+  # Uniformly select 1 matched pair among the K_b active mutual pairs in each
+  # walker/state: assign ranks 0, 1, ..., K_b - 1 to the True entries of
+  # active_paired_e and draw chosen_rank ~ Uniform({0, ..., K_b - 1}).
+  num_pairs_active = jnp.sum(active_paired_e.astype(jnp.int32), axis=-1)
+  has_pair_state = num_pairs_active > 0
+  pair_rank = jnp.cumsum(active_paired_e.astype(jnp.int32), axis=-1) - 1
+  u_pair = jax.random.uniform(subkey_pair, shape=(total_states,))
+  chosen_rank = jnp.floor(
+      u_pair * jnp.maximum(num_pairs_active, 1).astype(u_pair.dtype)
+  ).astype(jnp.int32)
+  selected_e_mask = active_paired_e & (pair_rank == chosen_rank[:, None])
+
+  chosen_h_idx = jnp.sum(
+      jnp.where(selected_e_mask, partner_h_1, 0), axis=-1
+  )
+  selected_h_mask = has_pair_state[:, None] & (
+      jnp.arange(n_h, dtype=chosen_h_idx.dtype)[None, :] == chosen_h_idx[:, None]
+  )
+
+  # Uniformly select 1 nearest-neighbor moire lattice vector per walker/state.
+  hop_vecs = jnp.asarray(hop_vectors, dtype=x1.dtype)
+  n_vecs = hop_vecs.shape[0]
+  vec_idx = jax.random.randint(
+      subkey_vec, shape=(total_states,), minval=0, maxval=n_vecs
+  )
+  hop_vec = hop_vecs[vec_idx]  # (total_states, ndim)
+
+  eta_e = jnp.where(selected_e_mask[..., None], hop_vec[:, None, :], 0.0)
+  eta_h = jnp.where(selected_h_mask[..., None], hop_vec[:, None, :], 0.0)
+
+  pos_e_2 = pos_e_1 + eta_e
+  pos_h_2 = pos_h_1 + eta_h
+  pos_2 = jnp.concatenate([pos_e_2, pos_h_2], axis=1)
+  x2_wrapped = map_to_cell(jnp.reshape(pos_2, [batch_size, -1]))
+  pos_2_wrapped = jnp.reshape(x2_wrapped, [total_states, nelec, ndim])
+
+  # Preserve unselected particles' coordinates bit-for-bit to avoid float32
+  # re-wrapping roundoff on particles that were not proposed to move.
+  pos_e_2_w = jnp.where(
+      selected_e_mask[..., None], pos_2_wrapped[:, :n_e, :], pos_e_1
+  )
+  pos_h_2_w = jnp.where(
+      selected_h_mask[..., None], pos_2_wrapped[:, n_e:, :], pos_h_1
+  )
+
+  # Detect non-trivial geometric displacement of the selected pair (excluding
+  # zero-pair walkers and periodic identity translations where `a` is a
+  # simulation supercell lattice vector that wraps back to the original point).
+  pos_1_wrapped = jnp.reshape(map_to_cell(x1), [total_states, nelec, ndim])
+  sel_e_1 = jnp.sum(
+      jnp.where(selected_e_mask[..., None], pos_e_1, 0.0),
+      axis=1,
+      keepdims=True,
+  )
+  sel_e_1_w = jnp.sum(
+      jnp.where(selected_e_mask[..., None], pos_1_wrapped[:, :n_e, :], 0.0),
+      axis=1,
+      keepdims=True,
+  )
+  sel_e_2 = jnp.sum(
+      jnp.where(selected_e_mask[..., None], pos_e_2_w, 0.0),
+      axis=1,
+      keepdims=True,
+  )
+  mic_move_sq = dist_sq_fn(sel_e_2, sel_e_1)[:, 0, 0]
+  wrapped_move_sq = jnp.sum((sel_e_2[:, 0, :] - sel_e_1_w[:, 0, :]) ** 2, axis=-1)
+  moved_dist_sq = jnp.minimum(mic_move_sq, wrapped_move_sq)
+  min_hop_sq = jnp.min(jnp.sum(hop_vecs**2, axis=-1))
+  hop_tol_sq = jnp.maximum(1e-6, 1e-4 * min_hop_sq)
+  moved_state = has_pair_state & (moved_dist_sq > hop_tol_sq)
+
+  active_move_e = selected_e_mask & moved_state[:, None]
+  active_move_h = selected_h_mask & moved_state[:, None]
+  pos_e_2_w = jnp.where(active_move_e[..., None], pos_e_2_w, pos_e_1)
+  pos_h_2_w = jnp.where(active_move_h[..., None], pos_h_2_w, pos_h_1)
+  x2 = jnp.reshape(
+      jnp.concatenate([pos_e_2_w, pos_h_2_w], axis=1), [batch_size, -1]
+  )
+
+  partner_h_2, _ = _find_mutual_eh_pairs(
+      pos_e_2_w, pos_h_2_w, pair_radius, dist_sq_fn
+  )
+  same_pairing = jnp.all(
+      jnp.reshape(partner_h_1 == partner_h_2, [batch_size, -1]), axis=-1
+  )
+  has_active_pair = jnp.any(
+      jnp.reshape(selected_e_mask, [batch_size, -1]), axis=-1
+  )
+  moved = jnp.any(jnp.reshape(moved_state, [batch_size, -1]), axis=-1)
+  valid_active_pair = has_active_pair & moved & same_pairing
+
+  lp_2 = 2.0 * f(params, x2, data.spins, data.atoms, data.charges)
+  ratio = jnp.asarray(jnp.where(valid_active_pair, lp_2 - lp_1, -jnp.inf))
+  key, accept_subkey = jax.random.split(key)
+  rnd = jnp.log(jax.random.uniform(accept_subkey, shape=ratio.shape))
+  cond = (ratio > rnd) & valid_active_pair
+  x_new = jnp.asarray(jnp.where(cond[..., None], x2, x1))
+  lp_new = jnp.asarray(jnp.where(cond, lp_2, lp_1))
+  num_accepts = num_accepts + jnp.sum(cond)
+  new_data = networks.FermiNetData(**(dict(data) | {'positions': x_new}))  # type: ignore[arg-type]  # pyrefly: ignore[no-matching-overload]
+
+  num_map_rejects = jnp.sum(
+      (has_active_pair & moved & (~same_pairing)).astype(jnp.float32)
+  )
+  pairs_per_walker = (
+      jnp.sum(
+          jnp.reshape(is_paired_e_1, [batch_size, -1]).astype(jnp.float32),
+          axis=-1,
+      )
+      / float(num_states)
+  )
+  total_pairs = jnp.sum(pairs_per_walker)
+  active_pair_tries = jnp.sum(valid_active_pair.astype(jnp.float32))
+  active_pair_accepts = jnp.sum(cond.astype(jnp.float32))
+  return (
+      new_data,
+      key,
+      lp_new,
+      num_accepts,
+      num_map_rejects,
+      total_pairs,
+      active_pair_tries,
+      active_pair_accepts,
+  )
+
+
+def mh_pair_interwell_update(
+    params: networks.ParamTree,
+    f: networks.LogFermiNetLike | Callable[..., jnp.ndarray],
+    data: networks.FermiNetData,
+    key: chex.PRNGKey,
+    lp_1: Any,
+    num_accepts: Any,
+    pair_lattice: jnp.ndarray | np.ndarray | None = None,
+    hop_vectors: jnp.ndarray | np.ndarray | None = None,
+    atoms: Any = None,
+    ndim: int = 2,
+    map_to_cell: Callable[[jnp.ndarray], jnp.ndarray] = lambda x: x,
+    blocks: int = 1,
+    i: int | jnp.ndarray = 0,
+    layer_counts: tuple[int, int] = (0, 0),
+    pair_radius: float = 0.0,
+    dist_sq_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray] | None = None,
+    return_pair_diagnostics: bool = False,
+):
+  """Performs one Metropolis-Hastings inter-well pair hop by a moire lattice vector.
+
+  Selects one mutual nearest-neighbor (e, h) pair uniformly at random per walker
+  and translates both particles by a randomly chosen nearest-neighbor moire
+  lattice vector `a` from `hop_vectors` (or derived from `pair_lattice`),
+  leaving all other particles fixed. Enforces exact detailed balance via full
+  mutual-nearest-neighbor pairing-map preservation (`partner_h_2 == partner_h_1`).
+  """
+  if hop_vectors is None:
+    if pair_lattice is None:
+      raise ValueError(
+          'mh_pair_interwell_update requires either pair_lattice or hop_vectors.'
+      )
+    resolved_hop_vecs = _make_moire_hop_vectors(pair_lattice, ndim=ndim)
+  else:
+    resolved_hop_vecs = _validate_hop_vectors(hop_vectors, ndim=ndim)
+
+  out = _mh_pair_interwell_update_with_diagnostics(
+      params=params,
+      f=f,
+      data=data,
+      key=key,
+      lp_1=lp_1,
+      num_accepts=num_accepts,
+      hop_vectors=resolved_hop_vecs,
+      atoms=atoms,
+      ndim=ndim,
+      map_to_cell=map_to_cell,
+      blocks=blocks,
+      i=i,
+      layer_counts=layer_counts,
+      pair_radius=pair_radius,
+      dist_sq_fn=dist_sq_fn,
+  )
+  if return_pair_diagnostics:
+    return out
+  return out[:4]
+
+
 def _mh_pair_update_with_diagnostics(
     params: networks.ParamTree,
     f: networks.LogFermiNetLike | Callable[..., jnp.ndarray],
@@ -411,6 +800,8 @@ def _mh_pair_update_with_diagnostics(
     pair_radius: float = 0.0,
     dist_sq_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray] | None = None,
     unpaired_stddev: float | jnp.ndarray | None = None,
+    pair_lattice: jnp.ndarray | np.ndarray | None = None,
+    hop_vectors: jnp.ndarray | np.ndarray | None = None,
 ) -> tuple[
     networks.FermiNetData,
     chex.PRNGKey,
@@ -445,6 +836,30 @@ def _mh_pair_update_with_diagnostics(
     )
     zero = jnp.zeros((), dtype=jnp.float32)
     return (out_data, out_key, out_lp, out_acc, zero, zero, zero, zero)
+
+  if hop_vectors is not None or pair_lattice is not None:
+    resolved_hop_vecs = (
+        _validate_hop_vectors(hop_vectors, ndim=ndim)
+        if hop_vectors is not None
+        else _make_moire_hop_vectors(pair_lattice, ndim=ndim)  # type: ignore[arg-type]
+    )
+    return _mh_pair_interwell_update_with_diagnostics(
+        params=params,
+        f=f,
+        data=data,
+        key=key,
+        lp_1=lp_1,
+        num_accepts=num_accepts,
+        hop_vectors=resolved_hop_vecs,
+        atoms=atoms,
+        ndim=ndim,
+        map_to_cell=map_to_cell,
+        blocks=blocks,
+        i=i,
+        layer_counts=layer_counts,
+        pair_radius=pair_radius,
+        dist_sq_fn=dist_sq_fn,
+    )
 
   if dist_sq_fn is None:
     dist_sq_fn = _make_minimum_image_dist_sq_fn(None)
@@ -505,12 +920,16 @@ def _mh_pair_update_with_diagnostics(
   pos_e_2 = pos_e_1 + eta_e
   pos_h_2 = pos_h_1 + eta_h
   pos_2 = jnp.concatenate([pos_e_2, pos_h_2], axis=1)
-  x2 = jnp.reshape(pos_2, [batch_size, -1])
-  x2 = map_to_cell(x2)
+  x2_wrapped = map_to_cell(jnp.reshape(pos_2, [batch_size, -1]))
 
-  pos_2_wrapped = jnp.reshape(x2, [batch_size * num_states, nelec, ndim])
-  pos_e_2_w = pos_2_wrapped[:, :n_e, :]
-  pos_h_2_w = pos_2_wrapped[:, n_e:, :]
+  pos_2_wrapped = jnp.reshape(x2_wrapped, [batch_size * num_states, nelec, ndim])
+  moved_e = jnp.any(eta_e != 0.0, axis=-1, keepdims=True)
+  moved_h = jnp.any(eta_h != 0.0, axis=-1, keepdims=True)
+  pos_e_2_w = jnp.where(moved_e, pos_2_wrapped[:, :n_e, :], pos_e_1)
+  pos_h_2_w = jnp.where(moved_h, pos_2_wrapped[:, n_e:, :], pos_h_1)
+  x2 = jnp.reshape(
+      jnp.concatenate([pos_e_2_w, pos_h_2_w], axis=1), [batch_size, -1]
+  )
   partner_h_2, _ = _find_mutual_eh_pairs(
       pos_e_2_w, pos_h_2_w, pair_radius, dist_sq_fn
   )
@@ -576,6 +995,8 @@ def mh_pair_update(
     pair_radius: float = ...,
     dist_sq_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray] | None = ...,
     unpaired_stddev: float | jnp.ndarray | None = ...,
+    pair_lattice: jnp.ndarray | np.ndarray | None = ...,
+    hop_vectors: jnp.ndarray | np.ndarray | None = ...,
     return_pair_diagnostics: Literal[False] = ...,
 ) -> tuple[networks.FermiNetData, chex.PRNGKey, jnp.ndarray, jnp.ndarray]:
   ...
@@ -599,6 +1020,8 @@ def mh_pair_update(
     pair_radius: float = ...,
     dist_sq_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray] | None = ...,
     unpaired_stddev: float | jnp.ndarray | None = ...,
+    pair_lattice: jnp.ndarray | np.ndarray | None = ...,
+    hop_vectors: jnp.ndarray | np.ndarray | None = ...,
     *,
     return_pair_diagnostics: Literal[True],
 ) -> tuple[
@@ -631,18 +1054,22 @@ def mh_pair_update(
     pair_radius: float = 0.0,
     dist_sq_fn: Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray] | None = None,
     unpaired_stddev: float | jnp.ndarray | None = None,
+    pair_lattice: jnp.ndarray | np.ndarray | None = None,
+    hop_vectors: jnp.ndarray | np.ndarray | None = None,
     return_pair_diagnostics: bool = False,
 ):
   """Performs one Metropolis-Hastings step shifting bound (e, h) pairs together.
 
-  Mutual nearest-neighbor electron-hole pairs within `pair_radius` are shifted
-  by the same Gaussian displacement vector (with width `stddev`, i.e. sigma_p)
-  so that bound excitons translate across the moire potential without stretching
-  their internal relative coordinate r_e - r_h. Unpaired particles are shifted
-  independently with width `unpaired_stddev` (i.e. sigma_n, defaulting to
-  `stddev` if not specified). Exact detailed balance is enforced by requiring
-  the mutual-nearest-neighbor pairing map within `pair_radius` to be identical
-  in the initial and proposed configurations.
+  When `pair_lattice` or `hop_vectors` is provided (the default in moire
+  bilayer systems), performs an explicit inter-well pair hop: selects one
+  matched mutual nearest-neighbor (e, h) pair uniformly at random per walker
+  and translates both particles by a randomly chosen nearest-neighbor moire
+  lattice vector while keeping all other particles fixed. When neither
+  `pair_lattice` nor `hop_vectors` is provided, falls back to shifting mutual
+  nearest-neighbor pairs by Gaussian displacements of width `stddev`. Exact
+  detailed balance is enforced in both modes by requiring the mutual
+  nearest-neighbor pairing map within `pair_radius` to be identical in the
+  initial and proposed configurations.
 
   Args:
     params: Wavefunction parameters.
@@ -651,7 +1078,8 @@ def mh_pair_update(
     key: RNG state.
     lp_1: Log probability 2*log|psi(x1)|.
     num_accepts: Running total of accepted MH moves.
-    stddev: Width of Gaussian move proposal for matched pairs (sigma_p).
+    stddev: Width of Gaussian move proposal for matched pairs (used when
+      `pair_lattice` and `hop_vectors` are None).
     atoms: Must be None (asymmetric nuclear scaling is not supported).
     ndim: Dimensionality of system.
     map_to_cell: Callable mapping positions into the simulation cell in PBC.
@@ -661,7 +1089,11 @@ def mh_pair_update(
     pair_radius: Cutoff radius R_c (in Bohr) for pairing an electron and hole.
     dist_sq_fn: Pairwise squared distance function (minimum-image in PBC).
     unpaired_stddev: Optional width of Gaussian move proposal for unpaired
-      particles (sigma_n). Defaults to `stddev` when None.
+      particles when `pair_lattice` and `hop_vectors` are None.
+    pair_lattice: Optional `(ndim, ndim)` primitive moire lattice matrix whose
+      nearest-neighbor lattice vectors define discrete inter-well pair hops.
+    hop_vectors: Optional `(n_vectors, ndim)` array of explicit inter-well
+      lattice translation vectors.
     return_pair_diagnostics: If True, also returns `(num_map_rejects,
       total_pairs, active_pair_tries, active_pair_accepts)` for the step.
 
@@ -670,12 +1102,6 @@ def mh_pair_update(
     `(new_data, key, lp_new, num_accepts, num_map_rejects, total_pairs,
     active_pair_tries, active_pair_accepts)` when
     `return_pair_diagnostics=True`.
-    num_map_rejects: Number of proposals rejected due to pairing map mismatch.
-    total_pairs: Total number of mutual (e, h) pairs summed over the batch.
-    active_pair_tries: How many walkers (out of batch_size) actually translated
-      at least one matched pair in this step.
-    active_pair_accepts: How many walkers translated at least one matched pair
-      and were accepted in this step.
   """
   out = _mh_pair_update_with_diagnostics(
       params=params,
@@ -694,6 +1120,8 @@ def mh_pair_update(
       pair_radius=pair_radius,
       dist_sq_fn=dist_sq_fn,
       unpaired_stddev=unpaired_stddev,
+      pair_lattice=pair_lattice,
+      hop_vectors=hop_vectors,
   )
   if return_pair_diagnostics:
     return out
@@ -714,6 +1142,8 @@ def make_mcmc_step(
     pair_radius: float = 0.0,
     pair_width_scale: float = 1.0,
     pair_min_fraction: float = 2.0 / 3.0,
+    pair_lattice: jnp.ndarray | np.ndarray | None = None,
+    hop_vectors: jnp.ndarray | np.ndarray | None = None,
     return_stats: bool = False,
 ):
   """Creates the MCMC step function.
@@ -743,15 +1173,22 @@ def make_mcmc_step(
     pair_radius: Cutoff distance (in Bohr) within which mutual nearest-neighbor
       electron-hole pairs are shifted together during pair moves.
     pair_width_scale: Initial or fallback multiplicative scale factor applied to
-      `width` during joint pair moves when `width` is passed as a scalar.
-      Defaults to 1.0.
+      `width` during fallback Gaussian pair moves when `pair_lattice` and
+      `hop_vectors` are None. Defaults to 1.0.
     pair_min_fraction: Minimum fraction in [0, 1] of `min(n_electrons, n_holes)`
       that must be bound into mutual nearest-neighbor pairs on average across
       walkers before joint pair sweeps are enabled. Defaults to 2/3.
+    pair_lattice: Optional `(ndim, ndim)` primitive moire lattice matrix whose
+      nearest-neighbor lattice vectors define discrete inter-well pair hops
+      (translating one randomly selected matched pair per walker by a nearest-
+      neighbor moire lattice vector while leaving all other particles fixed).
+    hop_vectors: Optional `(n_vectors, ndim)` array of explicit inter-well
+      lattice translation vectors.
     return_stats: If True, `mcmc_step` returns `(new_data, stats_dict)` with
       separate ordinary/pair attempt and acceptance counts, acceptance rates,
-      pair-map rejection rate, and mean number of identified pairs per walker.
-      Defaults to False for full backward compatibility.
+      pair-map rejection rate, Metropolis rejection rate, and mean number of
+      identified pairs per walker. Defaults to False for full backward
+      compatibility.
 
   Returns:
     Callable which performs the set of MCMC steps.
@@ -784,6 +1221,22 @@ def make_mcmc_step(
         'pair_radius must be > 0 when pair_prob > 0 and both carrier layers '
         f'are occupied, got pair_radius={pair_radius}.'
     )
+
+  if hop_vectors is not None:
+    validated_hop_vectors = _validate_hop_vectors(hop_vectors, ndim=ndim)
+  else:
+    validated_hop_vectors = None
+
+  if use_pair_moves and (
+      validated_hop_vectors is not None or pair_lattice is not None
+  ):
+    resolved_hop_vectors = (
+        validated_hop_vectors
+        if validated_hop_vectors is not None
+        else _make_moire_hop_vectors(pair_lattice, ndim=ndim)  # type: ignore[arg-type]
+    )
+  else:
+    resolved_hop_vectors = None
 
   inner_fun = mh_block_update if blocks > 1 else mh_update
 
@@ -1014,6 +1467,7 @@ def make_mcmc_step(
           pair_radius=pair_radius,
           dist_sq_fn=dist_sq_fn,
           unpaired_stddev=normal_width,
+          hop_vectors=resolved_hop_vectors,
       )
       acc_p = acc_p + jnp.sum(step_acc).astype(jnp.float32)
       try_p = try_p + batch_f
@@ -1111,6 +1565,12 @@ def make_mcmc_step(
         n_map_rej_pair / jnp.maximum(n_try_pair, 1.0),
         jnp.nan,
     )
+    n_mh_rej_pair = jnp.maximum(n_try_pair_active - n_acc_pair_active, 0.0)
+    pair_mh_reject_rate = jnp.where(
+        n_try_pair > 0.0,
+        n_mh_rej_pair / jnp.maximum(n_try_pair, 1.0),
+        jnp.nan,
+    )
     mean_num_pairs = jnp.where(
         n_try_pair > 0.0,
         sum_pairs / jnp.maximum(n_try_pair, 1.0),
@@ -1128,7 +1588,9 @@ def make_mcmc_step(
         'n_try_pair_active': n_try_pair_active,
         'n_acc_pair_active': n_acc_pair_active,
         'n_map_rej_pair': n_map_rej_pair,
+        'n_mh_rej_pair': n_mh_rej_pair,
         'pair_map_reject_rate': pair_map_reject_rate,
+        'pair_mh_reject_rate': pair_mh_reject_rate,
         'mean_num_pairs': mean_num_pairs,
         'min_pairs_required': jnp.asarray(min_pairs_required, dtype=jnp.float32),
         'pair_moves_enabled': jnp.asarray(pair_gate_open, dtype=bool),
@@ -1144,15 +1606,21 @@ def init_pair_mcmc_width(
     pair_width_scale: float = 1.0,
     pair_min_fraction: float = 2.0 / 3.0,
     pair_moves_enabled: bool | None = None,
+    pair_hop_distance: float | None = None,
 ) -> jnp.ndarray:
   """Initializes `[width_normal, width_pair, pair_moves_enabled]` state."""
   if pair_moves_enabled is None:
     pair_moves_enabled = float(pair_min_fraction) <= 0.0
   w0 = float(move_width)
+  wp = (
+      float(pair_hop_distance)
+      if pair_hop_distance is not None
+      else w0 * float(pair_width_scale)
+  )
   return jnp.asarray(
       [
           w0,
-          w0 * float(pair_width_scale),
+          wp,
           1.0 if pair_moves_enabled else 0.0,
       ],
       dtype=jnp.float32,
@@ -1162,6 +1630,7 @@ def init_pair_mcmc_width(
 def init_pair_mcmc_adaptation_state(
     adapt_frequency: int,
     pair_moves_enabled: bool = True,
+    adapt_pair_width: bool = True,
 ) -> dict[str, Any]:
   """Initializes window buffers and latch state for pair MCMC adaptation."""
   n = max(1, int(adapt_frequency))
@@ -1172,6 +1641,7 @@ def init_pair_mcmc_adaptation_state(
       'acc_pair': np.zeros(n, dtype=np.float64),
       'pair_moves_enabled': bool(pair_moves_enabled),
       'pair_enabled_steps': n if pair_moves_enabled else 0,
+      'adapt_pair_width': bool(adapt_pair_width),
   }
 
 
@@ -1185,21 +1655,27 @@ def update_pair_mcmc_widths(
     pmove_min: float = 0.5,
     min_pairs_required: float | None = None,
     freeze_pair_schedule: bool = False,
+    adapt_pair_width: bool | None = None,
 ) -> tuple[jnp.ndarray, dict[str, Any]]:
-  """Independently adapts [normal_width, pair_width] and latches pair moves.
+  """Adapts `normal_width` (and optionally `pair_width`) and latches pair moves.
 
   Accumulates attempt and acceptance counts for ordinary and pair moves across
   the `adapt_frequency` window before dividing:
     - `A_n = sum(N_{acc,n}) / sum(N_{try,n})` updates `width[..., 0]` (sigma_n)
-    - `A_p = sum(N_{acc,p,active}) / sum(N_{try,p,active})` updates
-      `width[..., 1]` (sigma_p), counting only walker/block proposals that
-      actually translated at least one matched pair and preserved the
-      electron-hole pairing map (`same_pairing`).
+    - When `adapt_pair_width` is True, `A_p = sum(N_{acc,p,active}) /
+      sum(N_{try,p,active})` updates `width[..., 1]` (sigma_p). For discrete
+      inter-well lattice hops (`adapt_pair_width=False`), `width[..., 1]` is
+      kept fixed at the moire lattice spacing and never adapted toward 50-55%.
   If `width` has a 3rd entry (`pair_moves_enabled`) or `adapt_state` starts
   with `pair_moves_enabled=False`, once `mean_num_pairs >= min_pairs_required`
   is reached, `pair_moves_enabled` latches permanently to `True` (`width[..., 2]
   = 1.0`) and never switches back off.
   """
+  if adapt_pair_width is None:
+    do_adapt_pair_width = bool(adapt_state.get('adapt_pair_width', True))
+  else:
+    do_adapt_pair_width = bool(adapt_pair_width)
+
   has_enable_slot = width.ndim > 0 and width.shape[-1] == 3
   if has_enable_slot:
     currently_enabled = bool(np.asarray(width[..., 2]).reshape(-1)[0] > 0.5)
@@ -1273,7 +1749,8 @@ def update_pair_mcmc_widths(
         width = width.at[..., 0].divide(1.1)
 
     pair_ready = (
-        currently_enabled
+        do_adapt_pair_width
+        and currently_enabled
         and int(adapt_state.get('pair_enabled_steps', adapt_frequency))
         >= adapt_frequency
     )
