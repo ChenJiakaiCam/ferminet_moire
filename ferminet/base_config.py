@@ -151,6 +151,17 @@ def default() -> ml_collections.ConfigDict:
           # If None, assume OBC, if PBC then matrix with the
           # supercell lattice vectors
           'lattice': None,
+          # Optional enlarged crystal unit cell (e.g. Wigner-crystal unit cell
+          # L_unit = L_prim @ unit_cell_matrix as in arXiv:2406.11134). When
+          # None, single-particle periodic features use primitive_lattice (or
+          # lattice) unchanged for full backward compatibility.
+          'unit_cell_matrix': None,
+          'unit_cell_lattice': None,
+          # When unit_cell_matrix or unit_cell_lattice is specified in a moire
+          # config, whether supercell_matrix tiles the enlarged unit cell
+          # L_unit (True, matching arXiv:2406.11134 Table S4) or tiles the 1x1
+          # primitive moire cell L_prim (False).
+          'supercell_in_unit_cells': True,
           # number of spin up, spin-down electrons
           'electrons': tuple(),
           # Dimensionality.
@@ -221,6 +232,28 @@ def default() -> ml_collections.ConfigDict:
           # mean of the distance to the nuclei.
           'scale_by_nuclear_distance': False,
           'blocks': 1,  # Number of blocks to split the MCMC sampling into
+          # Probability in [0, 1) of proposing a joint electron-hole pair move
+          # (inter-well moire lattice hop when pair_lattice / moire_lattice is
+          # present) on each MCMC sweep (0.0 disables pair moves for full
+          # backward compatibility).
+          'pair_prob': 0.0,
+          # Cutoff radius (in Bohr) for identifying bound electron-hole pairs in
+          # pair MCMC moves. If <= 0 when pair_prob > 0 in a bilayer system,
+          # defaults to 1.5 * interlayer_distance.
+          'pair_radius': 0.0,
+          # Optional (ndim, ndim) primitive lattice matrix (columns are direct
+          # lattice vectors) defining nearest-neighbor inter-well pair-hop
+          # translations. When None in a moire bilayer system, defaults to the
+          # 1x1 primitive moire lattice (moire_lattice).
+          'pair_lattice': None,
+          # Multiplicative scale factor applied to the MCMC move width during
+          # fallback Gaussian joint electron-hole pair moves when pair_lattice
+          # is None.
+          'pair_width_scale': 1.0,
+          # Minimum batch-averaged fraction of min(n_electrons, n_holes) bound
+          # into mutual nearest-neighbor pairs required before enabling joint
+          # electron-hole pair MCMC sweeps.
+          'pair_min_fraction': 2.0 / 3.0,
       },
       'network': {
           'network_type': 'ferminet',  # One of 'ferminet' or 'psiformer'.
@@ -353,5 +386,7 @@ def resolve(cfg):
       # This makes the ConfigDict object serialisable.
       if callable(cfg.system.set_molecule):  # pyrefly: ignore[missing-attribute]
         cfg.system.set_molecule = cfg.system.set_molecule.__name__  # pyrefly: ignore[missing-attribute]
+  from ferminet.moire import geometry as moire_geometry  # pylint: disable=g-import-not-at-top
+  cfg = moire_geometry.apply_moire_unit_cell_config(cfg)
   cfg = cfg.copy_and_resolve_references()
   return cfg
