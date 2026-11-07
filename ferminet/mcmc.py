@@ -237,6 +237,22 @@ def mh_block_update(
   return new_data, key, lp_new, num_accepts
 
 
+def _safe_pmean(x: jnp.ndarray) -> jnp.ndarray:
+  """Computes pmean over PMAP_AXIS_NAME when present, else returns x."""
+  try:
+    return constants.pmean(x)
+  except ValueError:
+    return x
+
+
+def _safe_psum(x: jnp.ndarray) -> jnp.ndarray:
+  """Computes psum over PMAP_AXIS_NAME when present, else returns x."""
+  try:
+    return constants.psum(x)
+  except ValueError:
+    return x
+
+
 def _resolve_layer_counts(
     nspins: Sequence[int] | None,
     layer_counts: tuple[int, int] | None,  # Try to resolve (n_electrons, n_holes) using layer_counts first, then nspins. If both are None, return (0, 0).
@@ -514,16 +530,22 @@ def _mh_pair_update_with_diagnostics(
   new_data = networks.FermiNetData(**(dict(data) | {'positions': x_new}))  # type: ignore[arg-type]  # pyrefly: ignore[no-matching-overload]
 
   num_map_rejects = jnp.sum((moved & (~same_pairing)).astype(jnp.float32))
-  pairs_per_walker = jnp.sum(
-      jnp.reshape(is_paired_e_1, [batch_size, -1]).astype(jnp.float32),
-      axis=-1,
+  pairs_per_walker = (
+      jnp.sum(
+          jnp.reshape(is_paired_e_1, [batch_size, -1]).astype(jnp.float32),
+          axis=-1,
+      )
+      / float(num_states)
   )
   total_pairs = jnp.sum(pairs_per_walker)
   has_active_pair = jnp.any(
       jnp.reshape(active_paired_h, [batch_size, -1]), axis=-1
   )
-  active_pair_tries = jnp.sum(has_active_pair.astype(jnp.float32))
-  active_pair_accepts = jnp.sum((cond & has_active_pair).astype(jnp.float32))
+  valid_active_pair = has_active_pair & same_pairing
+  active_pair_tries = jnp.sum(valid_active_pair.astype(jnp.float32))
+  active_pair_accepts = jnp.sum(
+      (cond & valid_active_pair).astype(jnp.float32)
+  )
   return (
       new_data,
       key,
@@ -691,6 +713,7 @@ def make_mcmc_step(
     pair_prob: float = 0.0,
     pair_radius: float = 0.0,
     pair_width_scale: float = 1.0,
+    pair_min_fraction: float = 2.0 / 3.0,
     return_stats: bool = False,
 ):
   """Creates the MCMC step function.
@@ -722,6 +745,9 @@ def make_mcmc_step(
     pair_width_scale: Initial or fallback multiplicative scale factor applied to
       `width` during joint pair moves when `width` is passed as a scalar.
       Defaults to 1.0.
+    pair_min_fraction: Minimum fraction in [0, 1] of `min(n_electrons, n_holes)`
+      that must be bound into mutual nearest-neighbor pairs on average across
+      walkers before joint pair sweeps are enabled. Defaults to 2/3.
     return_stats: If True, `mcmc_step` returns `(new_data, stats_dict)` with
       separate ordinary/pair attempt and acceptance counts, acceptance rates,
       pair-map rejection rate, and mean number of identified pairs per walker.
@@ -743,10 +769,16 @@ def make_mcmc_step(
     raise ValueError(
         f'pair_width_scale must be positive, got {pair_width_scale}.'
     )
+  pair_min_fraction = float(pair_min_fraction)
+  if not 0.0 <= pair_min_fraction <= 1.0:
+    raise ValueError(
+        f'pair_min_fraction must be in [0, 1], got {pair_min_fraction}.'
+    )
 
   resolved_layer_counts = _resolve_layer_counts(nspins, layer_counts)
   n_e, n_h = resolved_layer_counts
   use_pair_moves = (pair_prob > 0.0) and (n_e > 0) and (n_h > 0)
+  min_pairs_required = pair_min_fraction * float(min(n_e, n_h))
   if use_pair_moves and pair_radius <= 0.0:
     raise ValueError(
         'pair_radius must be > 0 when pair_prob > 0 and both carrier layers '
@@ -766,6 +798,7 @@ def make_mcmc_step(
   dist_sq_fn = (
       _make_minimum_image_dist_sq_fn(lattice) if use_pair_moves else None
   )
+  latch_state = {'pair_moves_enabled': pair_min_fraction <= 0.0}
 
   def mcmc_step(params, data, key, width) -> tuple[networks.FermiNetData, Any]:
     """Performs a set of MCMC steps.
@@ -776,8 +809,10 @@ def make_mcmc_step(
       key: RNG state.
       width: standard deviation to use in the move proposal. May be a scalar
         (in which case ordinary moves use `width` and pair moves use
-        `width * pair_width_scale`) or a length-2 array `[width_normal,
-        width_pair]` with independently adapted widths.
+        `width * pair_width_scale`), a length-2 array `[width_normal,
+        width_pair]`, or a length-3 array `[width_normal, width_pair,
+        pair_moves_enabled]` where the third entry is a latched warm-up flag
+        (0.0 before activation, 1.0 once activated).
 
     Returns:
       `(data, pmove)` when `return_stats=False`, or `(data, stats_dict)` when
@@ -785,12 +820,21 @@ def make_mcmc_step(
     """
     pos = data.positions
     width_arr = jnp.asarray(width)
-    if width_arr.ndim > 0 and width_arr.shape[-1] == 2:
+    has_explicit_enable_flag = (
+        width_arr.ndim > 0 and width_arr.shape[-1] == 3
+    )
+    if has_explicit_enable_flag:
       normal_width = width_arr[..., 0]
       pair_width = width_arr[..., 1]
+      explicit_pair_enabled = jnp.any(width_arr[..., 2] > 0.5)
+    elif width_arr.ndim > 0 and width_arr.shape[-1] == 2:
+      normal_width = width_arr[..., 0]
+      pair_width = width_arr[..., 1]
+      explicit_pair_enabled = None
     else:
       normal_width = width
       pair_width = width * pair_width_scale
+      explicit_pair_enabled = None
 
     nsteps = steps * blocks
     logprob = 2.0 * batch_network(
@@ -815,10 +859,53 @@ def make_mcmc_step(
           0, nsteps, legacy_single_step_fn, (data, key, logprob, 0.0)
       )
       pmove = jnp.sum(num_accepts) / (nsteps * batch_per_device)
-      pmove = constants.pmean(pmove)
+      pmove = _safe_pmean(pmove)
       return new_data, pmove
 
     if use_pair_moves:
+      nelec = n_e + n_h
+      num_states = max(1, pos.shape[-1] // (nelec * ndim))
+      pos_init_3d = jnp.reshape(
+          pos, [batch_per_device * num_states, nelec, ndim]
+      )
+      _, is_paired_init = _find_mutual_eh_pairs(
+          pos_init_3d[:, :n_e, :],
+          pos_init_3d[:, n_e:, :],
+          pair_radius,
+          dist_sq_fn,
+      )
+      init_pairs_per_walker = (
+          jnp.sum(
+              jnp.reshape(is_paired_init, [batch_per_device, -1]).astype(
+                  jnp.float32
+              ),
+              axis=-1,
+          )
+          / float(num_states)
+      )
+      init_mean_pairs = _safe_pmean(jnp.mean(init_pairs_per_walker))
+      if has_explicit_enable_flag:
+        assert explicit_pair_enabled is not None
+        pair_gate_open = explicit_pair_enabled
+      elif min_pairs_required <= 0.0:
+        pair_gate_open = jnp.asarray(True, dtype=bool)
+      elif not isinstance(init_mean_pairs, jax.core.Tracer):
+        if (
+            not latch_state['pair_moves_enabled']
+            and float(init_mean_pairs) >= min_pairs_required
+        ):
+          latch_state['pair_moves_enabled'] = True
+        pair_gate_open = jnp.asarray(
+            latch_state['pair_moves_enabled'], dtype=bool
+        )
+      else:
+        raise ValueError(
+            'JIT/pmap-compiled pair MCMC with pair_min_fraction > 0 requires '
+            'a 3-element width state [width_normal, width_pair, '
+            'pair_moves_enabled] (see mcmc.init_pair_mcmc_width), or set '
+            'pair_min_fraction=0.0 for a fixed schedule.'
+        )
+
       key, mode_key = jax.random.split(key)
       do_pair_sweeps = jax.random.bernoulli(
           mode_key, p=pair_prob, shape=(max(1, steps),)
@@ -831,7 +918,14 @@ def make_mcmc_step(
             do_pair_sweeps.at[0].set(False),
             do_pair_sweeps,
         )
+      do_pair_sweeps = jnp.where(
+          pair_gate_open,
+          do_pair_sweeps,
+          jnp.zeros_like(do_pair_sweeps),
+      )
     else:
+      init_mean_pairs = jnp.asarray(jnp.nan, dtype=jnp.float32)
+      pair_gate_open = jnp.asarray(False, dtype=bool)
       do_pair_sweeps = jnp.zeros((max(1, steps),), dtype=bool)
 
     batch_f = jnp.asarray(float(batch_per_device), dtype=jnp.float32)
@@ -980,14 +1074,14 @@ def make_mcmc_step(
         sum_pairs,
     ) = lax.fori_loop(0, nsteps, step_fn, init_carry)
 
-    n_acc_normal = constants.psum(n_acc_normal)
-    n_try_normal = constants.psum(n_try_normal)
-    n_acc_pair = constants.psum(n_acc_pair)
-    n_try_pair = constants.psum(n_try_pair)
-    n_acc_pair_active = constants.psum(n_acc_pair_active)
-    n_try_pair_active = constants.psum(n_try_pair_active)
-    n_map_rej_pair = constants.psum(n_map_rej_pair)
-    sum_pairs = constants.psum(sum_pairs)
+    n_acc_normal = _safe_psum(n_acc_normal)
+    n_try_normal = _safe_psum(n_try_normal)
+    n_acc_pair = _safe_psum(n_acc_pair)
+    n_try_pair = _safe_psum(n_try_pair)
+    n_acc_pair_active = _safe_psum(n_acc_pair_active)
+    n_try_pair_active = _safe_psum(n_try_pair_active)
+    n_map_rej_pair = _safe_psum(n_map_rej_pair)
+    sum_pairs = _safe_psum(sum_pairs)
 
     total_acc = n_acc_normal + n_acc_pair
     total_try = n_try_normal + n_try_pair
@@ -1020,7 +1114,7 @@ def make_mcmc_step(
     mean_num_pairs = jnp.where(
         n_try_pair > 0.0,
         sum_pairs / jnp.maximum(n_try_pair, 1.0),
-        jnp.nan,
+        init_mean_pairs,
     )
     stats = {
         'pmove': pmove,
@@ -1036,22 +1130,48 @@ def make_mcmc_step(
         'n_map_rej_pair': n_map_rej_pair,
         'pair_map_reject_rate': pair_map_reject_rate,
         'mean_num_pairs': mean_num_pairs,
+        'min_pairs_required': jnp.asarray(min_pairs_required, dtype=jnp.float32),
+        'pair_moves_enabled': jnp.asarray(pair_gate_open, dtype=bool),
     }
     return new_data, stats
 
+  mcmc_step.pair_state = latch_state  # type: ignore[attr-defined]
   return mcmc_step
+
+
+def init_pair_mcmc_width(
+    move_width: float,
+    pair_width_scale: float = 1.0,
+    pair_min_fraction: float = 2.0 / 3.0,
+    pair_moves_enabled: bool | None = None,
+) -> jnp.ndarray:
+  """Initializes `[width_normal, width_pair, pair_moves_enabled]` state."""
+  if pair_moves_enabled is None:
+    pair_moves_enabled = float(pair_min_fraction) <= 0.0
+  w0 = float(move_width)
+  return jnp.asarray(
+      [
+          w0,
+          w0 * float(pair_width_scale),
+          1.0 if pair_moves_enabled else 0.0,
+      ],
+      dtype=jnp.float32,
+  )
 
 
 def init_pair_mcmc_adaptation_state(
     adapt_frequency: int,
-) -> dict[str, np.ndarray]:
-  """Initializes window buffers for separate ordinary/pair width adaptation."""
+    pair_moves_enabled: bool = True,
+) -> dict[str, Any]:
+  """Initializes window buffers and latch state for pair MCMC adaptation."""
   n = max(1, int(adapt_frequency))
   return {
       'try_normal': np.zeros(n, dtype=np.float64),
       'acc_normal': np.zeros(n, dtype=np.float64),
       'try_pair': np.zeros(n, dtype=np.float64),
       'acc_pair': np.zeros(n, dtype=np.float64),
+      'pair_moves_enabled': bool(pair_moves_enabled),
+      'pair_enabled_steps': n if pair_moves_enabled else 0,
   }
 
 
@@ -1060,22 +1180,60 @@ def update_pair_mcmc_widths(
     width: jnp.ndarray,
     adapt_frequency: int,
     mcmc_stats: Mapping[str, jnp.ndarray | np.ndarray | float],
-    adapt_state: dict[str, np.ndarray],
+    adapt_state: dict[str, Any],
     pmove_max: float = 0.55,
     pmove_min: float = 0.5,
-) -> tuple[jnp.ndarray, dict[str, np.ndarray]]:
-  """Independently adapts [normal_width, pair_width] from accumulated counts.
+    min_pairs_required: float | None = None,
+    freeze_pair_schedule: bool = False,
+) -> tuple[jnp.ndarray, dict[str, Any]]:
+  """Independently adapts [normal_width, pair_width] and latches pair moves.
 
   Accumulates attempt and acceptance counts for ordinary and pair moves across
   the `adapt_frequency` window before dividing:
     - `A_n = sum(N_{acc,n}) / sum(N_{try,n})` updates `width[..., 0]` (sigma_n)
     - `A_p = sum(N_{acc,p,active}) / sum(N_{try,p,active})` updates
       `width[..., 1]` (sigma_p), counting only walker/block proposals that
-      actually translated at least one matched pair.
-  If a move type has zero qualifying attempts over the window, its width update
-  is skipped.
+      actually translated at least one matched pair and preserved the
+      electron-hole pairing map (`same_pairing`).
+  If `width` has a 3rd entry (`pair_moves_enabled`) or `adapt_state` starts
+  with `pair_moves_enabled=False`, once `mean_num_pairs >= min_pairs_required`
+  is reached, `pair_moves_enabled` latches permanently to `True` (`width[..., 2]
+  = 1.0`) and never switches back off.
   """
-  if adapt_frequency <= 0:
+  has_enable_slot = width.ndim > 0 and width.shape[-1] == 3
+  if has_enable_slot:
+    currently_enabled = bool(np.asarray(width[..., 2]).reshape(-1)[0] > 0.5)
+  else:
+    currently_enabled = bool(adapt_state.get('pair_moves_enabled', True))
+  currently_enabled = currently_enabled or bool(
+      adapt_state.get('pair_moves_enabled', False)
+  )
+  was_enabled_on_step = currently_enabled
+
+  if not currently_enabled and not freeze_pair_schedule:
+    if min_pairs_required is None:
+      if 'min_pairs_required' in mcmc_stats:
+        threshold = float(
+            np.asarray(mcmc_stats['min_pairs_required']).reshape(-1)[0]
+        )
+      else:
+        threshold = 0.0
+    else:
+      threshold = float(min_pairs_required)
+    mean_pairs = float(
+        np.asarray(mcmc_stats.get('mean_num_pairs', np.nan)).reshape(-1)[0]
+    )
+    if not np.isnan(mean_pairs) and mean_pairs >= threshold:
+      currently_enabled = True
+      adapt_state['try_pair'][:] = 0.0
+      adapt_state['acc_pair'][:] = 0.0
+      adapt_state['pair_enabled_steps'] = 0
+
+  adapt_state['pair_moves_enabled'] = currently_enabled
+  if has_enable_slot and currently_enabled:
+    width = width.at[..., 2].set(1.0)
+
+  if adapt_frequency <= 0 or freeze_pair_schedule:
     return width, adapt_state
   t_since_update = t % adapt_frequency
   try_p_key = (
@@ -1100,6 +1258,10 @@ def update_pair_mcmc_widths(
   adapt_state['acc_pair'][t_since_update] = float(
       np.asarray(mcmc_stats[acc_p_key]).reshape(-1)[0]
   )
+  if was_enabled_on_step:
+    adapt_state['pair_enabled_steps'] = (
+        int(adapt_state.get('pair_enabled_steps', adapt_frequency)) + 1
+    )
 
   if t > 0 and t_since_update == 0:
     total_try_n = float(np.sum(adapt_state['try_normal']))
@@ -1110,8 +1272,13 @@ def update_pair_mcmc_widths(
       elif a_n < pmove_min:
         width = width.at[..., 0].divide(1.1)
 
+    pair_ready = (
+        currently_enabled
+        and int(adapt_state.get('pair_enabled_steps', adapt_frequency))
+        >= adapt_frequency
+    )
     total_try_p = float(np.sum(adapt_state['try_pair']))
-    if total_try_p > 0.0:
+    if pair_ready and total_try_p > 0.0:
       a_p = float(np.sum(adapt_state['acc_pair'])) / total_try_p
       if a_p > pmove_max:
         width = width.at[..., 1].multiply(1.1)

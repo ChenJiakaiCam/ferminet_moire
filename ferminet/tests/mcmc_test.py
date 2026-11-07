@@ -337,6 +337,7 @@ class McmcTest(parameterized.TestCase):
             pair_prob=0.5,
             pair_radius=5.0,
             pair_width_scale=6.0,
+            pair_min_fraction=0.0,
         ),
         in_axes=(None, 0, 0, None),
     )
@@ -493,6 +494,10 @@ class McmcTest(parameterized.TestCase):
       mcmc.make_mcmc_step(log_psi, 4, pair_prob=1.2)
     with self.assertRaisesRegex(ValueError, 'pair_width_scale'):
       mcmc.make_mcmc_step(log_psi, 4, pair_width_scale=0.0)
+    with self.assertRaisesRegex(ValueError, 'pair_min_fraction'):
+      mcmc.make_mcmc_step(log_psi, 4, pair_min_fraction=-0.1)
+    with self.assertRaisesRegex(ValueError, 'pair_min_fraction'):
+      mcmc.make_mcmc_step(log_psi, 4, pair_min_fraction=1.1)
     with self.assertRaisesRegex(ValueError, 'pair_radius'):
       mcmc.make_mcmc_step(
           log_psi, 4, nspins=(2, 2), pair_prob=0.5, pair_radius=0.0
@@ -508,14 +513,17 @@ class McmcTest(parameterized.TestCase):
     self.assertEqual(cfg.mcmc.pair_prob, 0.0)
     self.assertEqual(cfg.mcmc.pair_radius, 0.0)
     self.assertEqual(cfg.mcmc.pair_width_scale, 1.0)
+    self.assertAlmostEqual(cfg.mcmc.pair_min_fraction, 2.0 / 3.0)
 
     # Enabling pair_prob and pair_radius via ConfigDict preserves type safety
     cfg.mcmc.pair_prob = 0.25
     cfg.mcmc.pair_radius = 50.0
     cfg.mcmc.pair_width_scale = 1.2
+    cfg.mcmc.pair_min_fraction = 0.75
     self.assertAlmostEqual(cfg.mcmc.pair_prob, 0.25)
     self.assertAlmostEqual(cfg.mcmc.pair_radius, 50.0)
     self.assertAlmostEqual(cfg.mcmc.pair_width_scale, 1.2)
+    self.assertAlmostEqual(cfg.mcmc.pair_min_fraction, 0.75)
 
   def test_unpaired_particles_use_unpaired_stddev(self):
     """Matched pairs move with sigma_p while unpaired particles move with sigma_n."""
@@ -615,28 +623,42 @@ class McmcTest(parameterized.TestCase):
             nspins=(n_e, n_h),
             pair_prob=0.5,
             pair_radius=5.0,
+            pair_min_fraction=0.5,
             return_stats=True,
         ),
         in_axes=(None, 0, 0, 0),
     )
     sharded_data = jax.tree_util.tree_map(lambda x: x[None, ...], data)
     sharded_key = jax.random.PRNGKey(99)[None, ...]
-    sharded_width = jnp.array([[0.15, 1.2]])
+    # Compiled threshold-controlled sampling requires the 3-element state
+    # [width_normal, width_pair, pair_moves_enabled].
+    with self.assertRaisesRegex(ValueError, 'pair_moves_enabled'):
+      step_fn({}, sharded_data, sharded_key, jnp.array([[0.15, 1.2]]))
+    sharded_width = jnp.array([[0.15, 1.2, 1.0]])
 
     _, stats = step_fn({}, sharded_data, sharded_key, sharded_width)
     n_try_n = float(stats['n_try_normal'][0])
     n_try_p = float(stats['n_try_pair'][0])
     n_acc_n = float(stats['n_acc_normal'][0])
     n_acc_p = float(stats['n_acc_pair'][0])
+    n_try_p_act = float(stats['n_try_pair_active'][0])
+    n_acc_p_act = float(stats['n_acc_pair_active'][0])
+    n_map_rej = float(stats['n_map_rej_pair'][0])
 
     self.assertEqual(n_try_n + n_try_p, float(10 * batch_size))
     self.assertGreater(n_try_n, 0.0)
     self.assertGreater(n_try_p, 0.0)
+    self.assertAlmostEqual(n_try_p_act, n_try_p - n_map_rej, places=5)
     self.assertAlmostEqual(
         float(stats['pmove_normal'][0]), n_acc_n / n_try_n, places=6
     )
     self.assertAlmostEqual(
         float(stats['pmove_pair'][0]), n_acc_p / n_try_p, places=6
+    )
+    self.assertAlmostEqual(
+        float(stats['pmove_pair_active'][0]),
+        n_acc_p_act / n_try_p_act,
+        places=6,
     )
     self.assertAlmostEqual(
         float(stats['pmove'][0]),
@@ -743,6 +765,7 @@ class McmcTest(parameterized.TestCase):
         nspins=(1, 1),
         pair_prob=0.5,
         pair_radius=5.0,
+        pair_min_fraction=0.0,
         return_stats=True,
     )
     key = jax.random.PRNGKey(2027)
@@ -771,6 +794,340 @@ class McmcTest(parameterized.TestCase):
       )
     self.assertGreater(float(width[0, 0]), 0.2)
     self.assertAlmostEqual(float(width[0, 1]), 1.0, places=6)
+
+  def test_pair_moves_gated_by_pair_min_fraction(self):
+    """Pair sweeps wait until mean_num_pairs >= threshold, then latch permanently."""
+    batch_size = 16
+    n_e, n_h = 3, 3
+    nelec = n_e + n_h
+    pair_radius = 5.0
+    flat_log_psi = lambda params, x, s, a, c: jnp.zeros((x.shape[0],))
+
+    # Default pair_min_fraction = 2/3 -> requires >= 2.0 pairs for n_e=n_h=3.
+    step_fn = mcmc.make_mcmc_step(
+        flat_log_psi,
+        batch_per_device=batch_size,
+        steps=10,
+        ndim=2,
+        nspins=(n_e, n_h),
+        pair_prob=0.5,
+        pair_radius=pair_radius,
+        return_stats=True,
+    )
+
+    # Case 1: Only 1 pair matched (1.0 < 2.0) -> 0 pair sweeps executed,
+    # 100% normal sweeps, and mean_num_pairs is still reported as 1.0.
+    pos_e_1 = jnp.broadcast_to(
+        jnp.array([[0.0, 0.0], [100.0, 0.0], [200.0, 0.0]])[None, ...],
+        (batch_size, n_e, 2),
+    )
+    pos_h_1 = jnp.broadcast_to(
+        jnp.array([[0.5, 0.0], [100.0, 50.0], [200.0, 50.0]])[None, ...],
+        (batch_size, n_h, 2),
+    )
+    x_1 = jnp.reshape(
+        jnp.concatenate([pos_e_1, pos_h_1], axis=1), (batch_size, nelec * 2)
+    )
+    data_1 = _make_dummy_data(x_1, nelec)
+    _, stats_1 = step_fn(
+        {}, data_1, jax.random.PRNGKey(42), jnp.array([0.1, 1.0])
+    )
+    self.assertEqual(float(stats_1['n_try_pair']), 0.0)
+    self.assertEqual(float(stats_1['n_try_normal']), float(10 * batch_size))
+    self.assertAlmostEqual(float(stats_1['mean_num_pairs']), 1.0, places=6)
+    self.assertFalse(bool(stats_1['pair_moves_enabled']))
+    self.assertTrue(bool(jnp.isnan(stats_1['pmove_pair_active'])))
+
+    # Case 2: 2 pairs matched (2.0 >= 2.0) -> pair gate latches open and pair sweeps run.
+    pos_h_2 = jnp.broadcast_to(
+        jnp.array([[0.5, 0.0], [100.5, 0.0], [200.0, 50.0]])[None, ...],
+        (batch_size, n_h, 2),
+    )
+    x_2 = jnp.reshape(
+        jnp.concatenate([pos_e_1, pos_h_2], axis=1), (batch_size, nelec * 2)
+    )
+    data_2 = _make_dummy_data(x_2, nelec)
+    _, stats_2 = step_fn(
+        {}, data_2, jax.random.PRNGKey(42), jnp.array([0.1, 1.0])
+    )
+    self.assertTrue(bool(stats_2['pair_moves_enabled']))
+    self.assertGreater(float(stats_2['n_try_pair']), 0.0)
+    self.assertAlmostEqual(float(stats_2['mean_num_pairs']), 2.0, delta=0.2)
+
+    # Case 3: Once latched, even if configurations fall back below threshold
+    # (1 pair matched < 2.0), pair moves remain permanently enabled!
+    _, stats_3 = step_fn(
+        {}, data_1, jax.random.PRNGKey(42), jnp.array([0.1, 1.0])
+    )
+    self.assertTrue(bool(stats_3['pair_moves_enabled']))
+    self.assertGreater(float(stats_3['n_try_pair']), 0.0)
+
+    # Verify the same one-way latch through 3-element mcmc_width and
+    # update_pair_mcmc_widths (used in pmapped training and checkpoints).
+    w_state = mcmc.init_pair_mcmc_width(
+        0.1, pair_width_scale=10.0, pair_min_fraction=2.0 / 3.0
+    )[None, :]
+    adapt_state = mcmc.init_pair_mcmc_adaptation_state(
+        4, pair_moves_enabled=False
+    )
+    self.assertEqual(float(w_state[0, 2]), 0.0)
+    _, stats_pre = step_fn({}, data_1, jax.random.PRNGKey(42), w_state[0])
+    self.assertEqual(float(stats_pre['n_try_pair']), 0.0)
+    w_state, adapt_state = mcmc.update_pair_mcmc_widths(
+        1, w_state, 4, stats_pre, adapt_state
+    )
+    self.assertEqual(float(w_state[0, 2]), 0.0)
+    self.assertFalse(adapt_state['pair_moves_enabled'])
+
+    # Crossing threshold in stats_2 latches w_state[..., 2] = 1.0 permanently.
+    w_state, adapt_state = mcmc.update_pair_mcmc_widths(
+        2, w_state, 4, stats_2, adapt_state
+    )
+    self.assertEqual(float(w_state[0, 2]), 1.0)
+    self.assertTrue(adapt_state['pair_moves_enabled'])
+
+    # Subsequent below-threshold stats_pre never reset w_state[..., 2].
+    w_state, adapt_state = mcmc.update_pair_mcmc_widths(
+        3, w_state, 4, stats_pre, adapt_state
+    )
+    self.assertEqual(float(w_state[0, 2]), 1.0)
+    self.assertTrue(adapt_state['pair_moves_enabled'])
+    _, stats_post = step_fn({}, data_1, jax.random.PRNGKey(42), w_state[0])
+    self.assertGreater(float(stats_post['n_try_pair']), 0.0)
+
+  def test_pair_threshold_normalized_for_multi_state(self):
+    """Multi-state pair count is normalized by num_states before threshold check."""
+    batch_size = 8
+    n_e, n_h = 1, 1
+    nelec = n_e + n_h
+    num_states = 2
+    pair_radius = 5.0
+    flat_log_psi = lambda params, x, s, a, c: jnp.zeros((x.shape[0],))
+
+    step_fn = mcmc.make_mcmc_step(
+        flat_log_psi,
+        batch_per_device=batch_size,
+        steps=10,
+        ndim=2,
+        blocks=num_states,
+        nspins=(n_e, n_h),
+        pair_prob=0.5,
+        pair_radius=pair_radius,
+        pair_min_fraction=2.0 / 3.0,
+        return_stats=True,
+    )
+
+    # State 0 is paired: e at (0, 0), h at (0.2, 0) -> dist 0.2 < 5.0
+    # State 1 is unpaired: e at (0, 0), h at (50.0, 0) -> dist 50.0 > 5.0
+    # Total pairs across 2 states = 1, so per-state paired fraction = 0.5 < 2/3.
+    state0 = jnp.array([0.0, 0.0, 0.2, 0.0])
+    state1 = jnp.array([0.0, 0.0, 50.0, 0.0])
+    x_half = jnp.broadcast_to(
+        jnp.concatenate([state0, state1])[None, :],
+        (batch_size, num_states * nelec * 2),
+    )
+    data_half = _make_dummy_data(x_half, num_states * nelec)
+    _, stats_half = step_fn(
+        {}, data_half, jax.random.PRNGKey(99), jnp.array([0.1, 1.0])
+    )
+    self.assertAlmostEqual(float(stats_half['mean_num_pairs']), 0.5, places=6)
+    self.assertFalse(bool(stats_half['pair_moves_enabled']))
+    self.assertEqual(float(stats_half['n_try_pair']), 0.0)
+
+    # When both states are paired (mean_num_pairs = 1.0 >= 2/3), pair moves activate.
+    x_both = jnp.broadcast_to(
+        jnp.concatenate([state0, state0])[None, :],
+        (batch_size, num_states * nelec * 2),
+    )
+    data_both = _make_dummy_data(x_both, num_states * nelec)
+    _, stats_both = step_fn(
+        {}, data_both, jax.random.PRNGKey(99), jnp.array([0.1, 1.0])
+    )
+    self.assertAlmostEqual(float(stats_both['mean_num_pairs']), 1.0, delta=0.1)
+    self.assertTrue(bool(stats_both['pair_moves_enabled']))
+    self.assertGreater(float(stats_both['n_try_pair']), 0.0)
+
+  def test_latched_pair_threshold_preserves_stationary_distribution(self):
+    """Latched pair threshold preserves the exact Gaussian paired probability."""
+    # Target: 1 electron and 1 hole in 2D, each coordinate ~ N(0, 1),
+    # so log|psi(x)| = -0.25 * sum(x^2) and 2*log|psi(x)| = -0.5 * sum(x^2).
+    # Since r_e - r_h ~ N(0, 2*I_2), |r_e - r_h|^2 / 2 ~ Exp(1), so for
+    # pair_radius = 1.0, exact P(|r_e - r_h| < 1) = 1 - exp(-1/4) = 0.221199.
+    # With batch_size = 1, a single walker fluctuates between 0 pairs (78% of
+    # the time, < 2/3) and 1 pair (22% of the time, >= 2/3). Once the threshold
+    # is crossed the first time, pair_moves_enabled latches to True and never
+    # switches back off, preserving the exact stationary distribution.
+    batch_size = 1
+    n_e, n_h = 1, 1
+    nelec = 2
+    pair_radius = 1.0
+    exact_paired_prob = 1.0 - float(np.exp(-0.25))
+
+    def gaussian_log_psi(params, x, s, a, c):
+      del params, s, a, c
+      return -0.25 * jnp.sum(x**2, axis=-1)
+
+    step_fn = mcmc.make_mcmc_step(
+        gaussian_log_psi,
+        batch_per_device=batch_size,
+        steps=30,
+        ndim=2,
+        nspins=(n_e, n_h),
+        pair_prob=0.5,
+        pair_radius=pair_radius,
+        pair_min_fraction=2.0 / 3.0,
+        return_stats=True,
+    )
+
+    # Step 0: Start unpaired at distance 3.0 (> 1.0) -> pair moves initially off.
+    data_unpaired = _make_dummy_data(
+        jnp.array([[0.0, 0.0, 3.0, 0.0]]), nelec
+    )
+    key = jax.random.PRNGKey(20261107)
+    key, subkey = jax.random.split(key)
+    data, stats0 = step_fn({}, data_unpaired, subkey, jnp.array([0.1, 0.1]))
+    self.assertFalse(bool(stats0['pair_moves_enabled']))
+    self.assertEqual(float(stats0['n_try_pair']), 0.0)
+
+    # Step 1: Walker visits a paired configuration (distance 0.2 < 1.0) ->
+    # latches pair_moves_enabled=True permanently.
+    data_paired = _make_dummy_data(
+        jnp.array([[0.0, 0.0, 0.2, 0.0]]), nelec
+    )
+    key, subkey = jax.random.split(key)
+    data, stats1 = step_fn({}, data_paired, subkey, jnp.array([0.1, 0.1]))
+    self.assertTrue(bool(stats1['pair_moves_enabled']))
+
+    # Step 2: Even when walker is unpaired again (distance 3.0 > 1.0),
+    # pair_moves_enabled remains True.
+    key, subkey = jax.random.split(key)
+    _, stats2 = step_fn({}, data_unpaired, subkey, jnp.array([0.1, 0.1]))
+    self.assertTrue(bool(stats2['pair_moves_enabled']))
+
+    # Verify stationary paired fraction across an ensemble of walkers after
+    # the latch has been triggered.
+    ens_batch = 512
+    ens_step = jax.jit(
+        mcmc.make_mcmc_step(
+            gaussian_log_psi,
+            batch_per_device=ens_batch,
+            steps=30,
+            ndim=2,
+            nspins=(n_e, n_h),
+            pair_prob=0.5,
+            pair_radius=pair_radius,
+            pair_min_fraction=2.0 / 3.0,
+            return_stats=True,
+        )
+    )
+    key, init_key = jax.random.split(key)
+    ens_data = _make_dummy_data(
+        jax.random.normal(init_key, (ens_batch, 4)), nelec
+    )
+    w_state = mcmc.init_pair_mcmc_width(
+        0.1, pair_width_scale=1.0, pair_min_fraction=2.0 / 3.0,
+        pair_moves_enabled=True,
+    )
+    paired_fractions = []
+    for step_idx in range(200):
+      key, subkey = jax.random.split(key)
+      ens_data, _ = ens_step({}, ens_data, subkey, w_state)
+      if step_idx >= 50:
+        pos_3d = jnp.reshape(ens_data.positions, (ens_batch, 2, 2))
+        dist_sq = jnp.sum((pos_3d[:, 0, :] - pos_3d[:, 1, :]) ** 2, axis=-1)
+        paired_fractions.append(float(jnp.mean(dist_sq < pair_radius**2)))
+
+    measured = float(np.mean(paired_fractions))
+    self.assertAlmostEqual(measured, exact_paired_prob, delta=0.025)
+
+  def test_map_rejects_excluded_from_active_pair_probability_and_width_adaptation(
+      self,
+  ):
+    """Map-change rejections do not count toward pmove_pair_active or shrink sigma_p."""
+    batch_size = 256
+    n_e, n_h = 1, 4
+    nelec = n_e + n_h
+    pair_radius = 5.0
+    # Electron e0 at (0, 0) is mutually paired with h0 at (4.8, 0) (dist 4.8).
+    # Three unpaired holes h1, h2, h3 sit at (-4.85, 0), (0, 4.85), (0, -4.85)
+    # (dist 4.85 > 4.8). When (e0, h0) translates jointly with sigma_p = 2.0
+    # while unpaired holes barely move (sigma_n = 0.01), >50% of proposals move
+    # e0 closer than 4.8 to one of h1, h2, h3 and violate same_pairing, while
+    # flat_log_psi accepts 100% of proposals that preserve same_pairing.
+    pos_e0 = jnp.broadcast_to(
+        jnp.array([[0.0, 0.0]])[None, ...], (batch_size, n_e, 2)
+    )
+    pos_h0 = jnp.broadcast_to(
+        jnp.array([[4.8, 0.0], [-4.85, 0.0], [0.0, 4.85], [0.0, -4.85]])[
+            None, ...
+        ],
+        (batch_size, n_h, 2),
+    )
+    x0 = jnp.reshape(
+        jnp.concatenate([pos_e0, pos_h0], axis=1), (batch_size, nelec * 2)
+    )
+    data = _make_dummy_data(x0, nelec)
+    flat_log_psi = lambda params, x, s, a, c: jnp.zeros((x.shape[0],))
+
+    (
+        _,
+        _,
+        _,
+        num_accepts,
+        num_map_rej,
+        total_pairs,
+        active_pair_tries,
+        active_pair_accepts,
+    ) = mcmc.mh_pair_update(
+        params={},
+        f=flat_log_psi,
+        data=data,
+        key=jax.random.PRNGKey(777),
+        lp_1=jnp.zeros((batch_size,)),
+        num_accepts=0.0,
+        stddev=2.0,
+        unpaired_stddev=0.01,
+        atoms=None,
+        ndim=2,
+        layer_counts=(n_e, n_h),
+        pair_radius=pair_radius,
+        return_pair_diagnostics=True,
+    )
+
+    # Over 50% of proposals are rejected due to pairing-map changes, so raw
+    # acceptance rate num_accepts / batch_size < 0.50.
+    self.assertGreater(float(num_map_rej) / batch_size, 0.50)
+    self.assertLess(float(num_accepts) / batch_size, 0.50)
+    self.assertAlmostEqual(float(total_pairs) / batch_size, 1.0, places=5)
+
+    # Active pair tries exclude map-change rejections, so active acceptance is 1.0.
+    self.assertAlmostEqual(
+        float(active_pair_tries), float(batch_size - num_map_rej), places=5
+    )
+    self.assertGreater(float(active_pair_tries), 0.0)
+    self.assertAlmostEqual(
+        float(active_pair_accepts / active_pair_tries), 1.0, places=6
+    )
+
+    # Feeding these counts into update_pair_mcmc_widths increases sigma_p by 1.1
+    # instead of shrinking it due to map rejections.
+    adapt_freq = 4
+    state = mcmc.init_pair_mcmc_adaptation_state(adapt_freq)
+    width = jnp.array([[0.2, 3.0]])
+    stats = {
+        'n_try_normal': jnp.array([float(batch_size)]),
+        'n_acc_normal': jnp.array([float(batch_size) * 0.52]),
+        'n_try_pair': jnp.array([float(batch_size)]),
+        'n_acc_pair': jnp.array([float(num_accepts)]),
+        'n_try_pair_active': jnp.array([float(active_pair_tries)]),
+        'n_acc_pair_active': jnp.array([float(active_pair_accepts)]),
+    }
+    for t in range(1, adapt_freq + 1):
+      width, state = mcmc.update_pair_mcmc_widths(
+          t, width, adapt_freq, stats, state
+      )
+    self.assertAlmostEqual(float(width[0, 0]), 0.2, places=6)
+    self.assertAlmostEqual(float(width[0, 1]), 3.0 * 1.1, places=6)
 
 
 if __name__ == '__main__':

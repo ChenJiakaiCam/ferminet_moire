@@ -243,6 +243,10 @@ def default() -> ml_collections.ConfigDict:
           # Multiplicative scale factor applied to the MCMC move width during
           # joint electron-hole pair moves.
           'pair_width_scale': 1.0,
+          # Minimum batch-averaged fraction of min(n_electrons, n_holes) bound
+          # into mutual nearest-neighbor pairs required before enabling joint
+          # electron-hole pair MCMC sweeps.
+          'pair_min_fraction': 2.0 / 3.0,
       },
       'network': {
           'network_type': 'ferminet',  # One of 'ferminet' or 'psiformer'.

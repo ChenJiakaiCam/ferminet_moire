@@ -728,6 +728,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   # Set up logging and observables
   pair_prob = float(cfg.mcmc.get('pair_prob', 0.0))
   pair_width_scale = float(cfg.mcmc.get('pair_width_scale', 1.0))
+  pair_min_fraction = float(cfg.mcmc.get('pair_min_fraction', 2.0 / 3.0))
   n_e_mcmc, n_h_mcmc = mcmc._resolve_layer_counts(nspins, None)
   use_pair_mcmc = (pair_prob > 0.0) and (n_e_mcmc > 0) and (n_h_mcmc > 0)
   train_schema = ['step', 'energy', 'ewmean', 'ewvar', 'pmove']
@@ -735,6 +736,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     train_schema += [
         'pmove_normal',
         'pmove_pair',
+        'pmove_pair_active',
         'pair_map_reject_rate',
         'mean_num_pairs',
         'width_normal',
@@ -859,6 +861,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
       pair_prob=pair_prob,
       pair_radius=pair_radius,
       pair_width_scale=pair_width_scale,
+      pair_min_fraction=pair_min_fraction,
       return_stats=use_pair_mcmc,
   )
 
@@ -1033,20 +1036,39 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     raise ValueError(f'Unknown optimizer: {optimizer}')
 
   if use_pair_mcmc:
+    is_inference = cfg.optim.optimizer == 'none'
     if mcmc_width_ckpt is not None:
-      w_ckpt = jnp.asarray(mcmc_width_ckpt[0])
+      w_ckpt = jnp.asarray(mcmc_width_ckpt[0], dtype=jnp.float32)
       if w_ckpt.ndim == 0:
-        w_init = jnp.asarray([w_ckpt, w_ckpt * pair_width_scale])
+        init_enabled = 1.0 if (is_inference or pair_min_fraction <= 0.0) else 0.0
+        w_init = jnp.asarray(
+            [w_ckpt, w_ckpt * pair_width_scale, init_enabled], dtype=jnp.float32
+        )
+      elif w_ckpt.shape[-1] == 2:
+        init_enabled = (
+            1.0
+            if (is_inference or pair_min_fraction <= 0.0 or t_init > 0)
+            else 0.0
+        )
+        w_init = jnp.asarray(
+            [w_ckpt[0], w_ckpt[1], init_enabled], dtype=jnp.float32
+        )
       else:
         w_init = w_ckpt
+        if is_inference or pair_min_fraction <= 0.0:
+          w_init = w_init.at[-1].set(1.0)
       mcmc_width = kfac_jax.utils.replicate_all_local_devices(w_init)
     else:
-      w0 = float(cfg.mcmc.move_width)
-      mcmc_width = kfac_jax.utils.replicate_all_local_devices(
-          jnp.asarray([w0, w0 * pair_width_scale])
+      w_init = mcmc.init_pair_mcmc_width(
+          cfg.mcmc.move_width,
+          pair_width_scale=pair_width_scale,
+          pair_min_fraction=pair_min_fraction,
+          pair_moves_enabled=(is_inference or pair_min_fraction <= 0.0),
       )
+      mcmc_width = kfac_jax.utils.replicate_all_local_devices(w_init)
     pair_adapt_state = mcmc.init_pair_mcmc_adaptation_state(
-        cfg.mcmc.adapt_frequency
+        cfg.mcmc.adapt_frequency,
+        pair_moves_enabled=bool(np.asarray(w_init[-1]) > 0.5),
     )
     pmoves = None
   else:
@@ -1146,6 +1168,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         pmove = mcmc_stats['pmove'][0]
         pmove_normal = mcmc_stats['pmove_normal'][0]
         pmove_pair = mcmc_stats['pmove_pair'][0]
+        pmove_pair_active = mcmc_stats['pmove_pair_active'][0]
         pair_map_reject_rate = mcmc_stats['pair_map_reject_rate'][0]
         mean_num_pairs = mcmc_stats['mean_num_pairs'][0]
       else:
@@ -1170,6 +1193,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
             cfg.mcmc.adapt_frequency,
             mcmc_stats,  # pyrefly: ignore[bad-argument-type]
             pair_adapt_state,  # pyrefly: ignore[bad-argument-type]
+            freeze_pair_schedule=(cfg.optim.optimizer == 'none'),
         )
       else:
         mcmc_width, pmoves = mcmc.update_mcmc_width(
@@ -1206,12 +1230,13 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
           width_normal_val = np.asarray(mcmc_width[0, 0])
           width_pair_val = np.asarray(mcmc_width[0, 1])
           logging_str += (
-              ', pmove_n=%0.2f, pmove_p=%0.2f, map_rej=%0.2f, pairs=%0.2f, '
-              'width_n=%0.3f, width_p=%0.3f'
+              ', pmove_n=%0.2f, pmove_p=%0.2f, pmove_p_act=%0.2f, '
+              'map_rej=%0.2f, pairs=%0.2f, width_n=%0.3f, width_p=%0.3f'
           )
           logging_args += (
               pmove_normal,  # pyrefly: ignore[unbound-name]
               pmove_pair,  # pyrefly: ignore[unbound-name]
+              pmove_pair_active,  # pyrefly: ignore[unbound-name]
               pair_map_reject_rate,  # pyrefly: ignore[unbound-name]
               mean_num_pairs,  # pyrefly: ignore[unbound-name]
               width_normal_val,
@@ -1219,6 +1244,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
           )
           writer_kwargs['pmove_normal'] = np.asarray(pmove_normal)  # pyrefly: ignore[unbound-name]
           writer_kwargs['pmove_pair'] = np.asarray(pmove_pair)  # pyrefly: ignore[unbound-name]
+          writer_kwargs['pmove_pair_active'] = np.asarray(pmove_pair_active)  # pyrefly: ignore[unbound-name]
           writer_kwargs['pair_map_reject_rate'] = np.asarray(
               pair_map_reject_rate  # pyrefly: ignore[unbound-name]
           )
