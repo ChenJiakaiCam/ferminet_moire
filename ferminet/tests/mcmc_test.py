@@ -1475,6 +1475,174 @@ class McmcTest(parameterized.TestCase):
     self.assertAlmostEqual(float(w_state[0, 0]), 2.0 / 1.1, places=5)
     self.assertAlmostEqual(float(w_state[0, 1]), a_m, places=5)
 
+  def test_make_moire_hop_distribution_three_shells_gaussian(self):
+    """_make_moire_hop_distribution returns 18 vectors across 3 shells with exact Gaussian radial weights."""
+    a_m = 151.18
+    prim_lattice = geometry.triangular_lattice(a_m)
+    hop_vecs, hop_probs = mcmc._make_moire_hop_distribution(
+        prim_lattice,
+        ndim=2,
+        max_shells=3,
+        hop_kernel='gaussian',
+        hop_scale=1.2,
+    )
+    vecs_np = np.asarray(hop_vecs, dtype=np.float64)
+    probs_np = np.asarray(hop_probs, dtype=np.float64)
+    self.assertEqual(vecs_np.shape, (18, 2))
+    self.assertEqual(probs_np.shape, (18,))
+    self.assertAlmostEqual(float(np.sum(probs_np)), 1.0, places=6)
+
+    norms = np.linalg.norm(vecs_np, axis=-1)
+    # First 6 vectors: shell 1 (r = a_M)
+    np.testing.assert_allclose(norms[:6], np.full(6, a_m), rtol=1e-5)
+    # Next 6 vectors: shell 2 (r = sqrt(3) * a_M)
+    np.testing.assert_allclose(
+        norms[6:12], np.full(6, np.sqrt(3.0) * a_m), rtol=1e-5
+    )
+    # Last 6 vectors: shell 3 (r = 2 * a_M)
+    np.testing.assert_allclose(norms[12:18], np.full(6, 2.0 * a_m), rtol=1e-5)
+
+    # Exact radial Gaussian probabilities exp(-r^2 / (2 * (1.2 a_M)^2))
+    w1 = np.exp(-1.0 / (2.0 * 1.2**2))
+    w2 = np.exp(-3.0 / (2.0 * 1.2**2))
+    w3 = np.exp(-4.0 / (2.0 * 1.2**2))
+    z = 6.0 * (w1 + w2 + w3)
+    np.testing.assert_allclose(probs_np[:6], np.full(6, w1 / z), rtol=1e-6)
+    np.testing.assert_allclose(probs_np[6:12], np.full(6, w2 / z), rtol=1e-6)
+    np.testing.assert_allclose(probs_np[12:18], np.full(6, w3 / z), rtol=1e-6)
+
+    # Every vector +a has its exact opposite -a with identical probability
+    validated_vecs, validated_probs = mcmc._validate_hop_vectors(
+        hop_vecs, ndim=2, hop_probs=hop_probs
+    )
+    self.assertEqual(validated_vecs.shape, (18, 2))
+    self.assertEqual(validated_probs.shape, (18,))
+
+    # Strongly anisotropic lattice with max_shells=3 returns the exact 3 shells
+    # (6 vectors of lengths 10, 20, 30) without forcing the distant 500-Bohr axis
+    aniso_lat = np.diag([10.0, 500.0])
+    aniso_vecs, aniso_probs = mcmc._make_moire_hop_distribution(
+        aniso_lat, ndim=2, max_shells=3, hop_kernel='gaussian', hop_scale=1.2
+    )
+    self.assertEqual(aniso_vecs.shape, (6, 2))
+    np.testing.assert_allclose(
+        np.linalg.norm(np.asarray(aniso_vecs), axis=-1),
+        np.array([10.0, 10.0, 20.0, 20.0, 30.0, 30.0]),
+        rtol=1e-5,
+    )
+    mcmc._validate_hop_vectors(aniso_vecs, ndim=2, hop_probs=aniso_probs)
+
+  def test_multishell_gaussian_interwell_hop_jumps_over_blocked_first_shell_and_preserves_detailed_balance(
+      self,
+  ):
+    """Multi-shell Gaussian inter-well hopping jumps across sqrt(3)*a_M 2nd-shell wells when 1st-shell wells are suppressed."""
+    a_m = 150.0
+    prim_lattice = geometry.triangular_lattice(a_m)
+    sim_lattice = geometry.supercell_lattice(prim_lattice, np.diag([6, 3]))
+    mic_disp_fn = geometry.make_minimum_image_distance_fn(sim_lattice)
+
+    # Place 3 target wells on the sqrt(3) x sqrt(3) sublattice separated by
+    # 2nd-shell vectors (+/- (2*a1 + a2), norm = sqrt(3)*a_M), with zero weight
+    # at 1st-shell neighbors so 1-shell hops have 0% acceptance while 3-shell
+    # Gaussian hops directly connect the wells via 2nd-shell jumps!
+    a1 = jnp.asarray(prim_lattice[:, 0])
+    a2 = jnp.asarray(prim_lattice[:, 1])
+    v_sqrt3 = 2.0 * a1 + a2  # norm = sqrt(3) * a_m in 120-deg triangular basis
+    well_centers = jnp.stack([
+        0.5 * a2,
+        0.5 * a2 + v_sqrt3,
+        0.5 * a2 + 2.0 * v_sqrt3,
+    ], axis=0)  # (3, 2)
+    target_probs = jnp.array([0.2, 0.5, 0.3])
+    log_weights = 0.5 * jnp.log(target_probs)
+    sigma_well = 3.0
+    sigma_bind = 1.0
+
+    def log_psi(params, x, spins, atoms, charges):
+      del params, spins, atoms, charges
+      pos = jnp.reshape(x, (-1, 2, 2))
+      r_e = pos[:, 0:1, :]
+      r_h = pos[:, 1:2, :]
+      _, r_eh = mic_disp_fn(r_e, r_h)
+      r_rel_sq = r_eh[:, 0, 0] ** 2
+      _, dist_to_wells = mic_disp_fn(
+          r_h, jnp.broadcast_to(well_centers[None, ...], (pos.shape[0], 3, 2))
+      )
+      d_well_sq = dist_to_wells[:, 0, :] ** 2
+      log_well_terms = log_weights[None, :] - 0.25 * d_well_sq / (sigma_well**2)
+      log_well = jax.scipy.special.logsumexp(log_well_terms, axis=-1)
+      log_bind = -0.25 * r_rel_sq / (sigma_bind**2)
+      return log_well + log_bind
+
+    batch_size = 512
+    r_h0 = jnp.broadcast_to(well_centers[0][None, :], (batch_size, 2))
+    x0 = jnp.reshape(jnp.stack([r_h0, r_h0], axis=1), (batch_size, 4))
+    data0 = _make_dummy_data(x0, 2)
+
+    step_1shell = jax.jit(
+        mcmc.make_mcmc_step(
+            log_psi,
+            batch_per_device=batch_size,
+            steps=80,
+            ndim=2,
+            lattice=sim_lattice,
+            nspins=(1, 1),
+            pair_prob=0.5,
+            pair_radius=30.0,
+            pair_min_fraction=0.0,
+            pair_lattice=prim_lattice,
+            pair_hop_shells=1,
+            return_stats=True,
+        )
+    )
+    step_3shell = jax.jit(
+        mcmc.make_mcmc_step(
+            log_psi,
+            batch_per_device=batch_size,
+            steps=80,
+            ndim=2,
+            lattice=sim_lattice,
+            nspins=(1, 1),
+            pair_prob=0.5,
+            pair_radius=30.0,
+            pair_min_fraction=0.0,
+            pair_lattice=prim_lattice,
+            pair_hop_shells=3,
+            pair_hop_kernel='gaussian',
+            pair_hop_scale=1.2,
+            return_stats=True,
+        )
+    )
+
+    key = jax.random.PRNGKey(20261110)
+    k1, k2 = jax.random.split(key)
+    data_1s, stats_1s = step_1shell({}, data0, k1, jnp.array([1.5, a_m, 1.0]))
+    data_3s, stats_3s = step_3shell({}, data0, k2, jnp.array([1.5, a_m, 1.0]))
+
+    # 1-shell hopping is completely trapped in Well 0 because all 1st-shell
+    # sites are at distance >= a_M from the sqrt(3) x sqrt(3) wells!
+    pos_1s = jnp.reshape(data_1s.positions, (batch_size, 2, 2))
+    _, d_1s = mic_disp_fn(
+        pos_1s[:, 1:2, :],
+        jnp.broadcast_to(well_centers[None, ...], (batch_size, 3, 2)),
+    )
+    well_idx_1s = jnp.argmin(d_1s[:, 0, :], axis=-1)
+    self.assertEqual(float(jnp.mean(well_idx_1s == 0)), 1.0)
+    self.assertEqual(float(stats_1s['n_acc_pair']), 0.0)
+
+    # 3-shell Gaussian hopping jumps across 2nd-shell vectors and equilibrates
+    # the exact target probabilities (0.2, 0.5, 0.3)!
+    pos_3s = jnp.reshape(data_3s.positions, (batch_size, 2, 2))
+    _, d_3s = mic_disp_fn(
+        pos_3s[:, 1:2, :],
+        jnp.broadcast_to(well_centers[None, ...], (batch_size, 3, 2)),
+    )
+    well_idx_3s = jnp.argmin(d_3s[:, 0, :], axis=-1)
+    for w_idx, expected_p in enumerate([0.2, 0.5, 0.3]):
+      measured_p = float(jnp.mean(well_idx_3s == w_idx))
+      self.assertAlmostEqual(measured_p, expected_p, delta=0.06)
+    self.assertGreater(float(stats_3s['n_acc_pair']), 0.0)
+
   def test_custom_hop_vectors_validation_rejects_asymmetric_or_invalid_inputs(
       self,
   ):
@@ -1542,6 +1710,107 @@ class McmcTest(parameterized.TestCase):
     ])
     validated = mcmc._validate_hop_vectors(valid_vecs, ndim=2)
     self.assertEqual(validated.shape, (6, 2))
+
+    # Duplicate vectors with partitioned symmetric probabilities P(+a) == P(-a)
+    dup_vecs = np.array([
+        [150.0, 0.0],
+        [150.0, 0.0],
+        [-150.0, 0.0],
+        [-150.0, 0.0],
+    ])
+    dup_probs = np.array([0.2, 0.3, 0.25, 0.25])
+    v_dup, p_dup = mcmc._validate_hop_vectors(
+        dup_vecs, ndim=2, hop_probs=dup_probs
+    )
+    self.assertEqual(v_dup.shape, (4, 2))
+    self.assertEqual(p_dup.shape, (4,))
+
+    # Asymmetric or invalid hop_probs must raise ValueError (including small-prob
+    # relative asymmetry 1e-6 vs 1e-5)
+    sym_two = np.array([[150.0, 0.0], [-150.0, 0.0]])
+    for bad_probs in [
+        np.array([0.7, 0.3]),  # asymmetric p(+a) != p(-a)
+        np.array([0.5, 0.4]),  # does not sum to 1
+        np.array([1.0, 0.0]),  # zero probability entry
+        np.array([1.2, -0.2]),  # negative probability
+        np.array([[0.5, 0.5]]),  # wrong shape (2D)
+    ]:
+      with self.assertRaises(ValueError):
+        mcmc._validate_hop_vectors(sym_two, ndim=2, hop_probs=bad_probs)
+      with self.assertRaises(ValueError):
+        mcmc.make_mcmc_step(
+            flat_log_psi,
+            batch_per_device=4,
+            steps=2,
+            ndim=2,
+            nspins=(1, 1),
+            pair_prob=0.5,
+            pair_radius=10.0,
+            hop_vectors=sym_two,
+            hop_probs=bad_probs,
+        )
+
+    small_asym_vecs = np.array([
+        [150.0, 0.0],
+        [-150.0, 0.0],
+        [0.0, 150.0],
+        [0.0, -150.0],
+    ])
+    small_asym_probs = np.array([1e-6, 1e-5, 0.5 - 5.5e-6, 0.5 - 5.5e-6])
+    with self.assertRaises(ValueError):
+      mcmc._validate_hop_vectors(
+          small_asym_vecs, ndim=2, hop_probs=small_asym_probs
+      )
+
+    # Invalid pair_hop_kernel or pair_hop_scale must raise ValueError even when
+    # pair_hop_shells=1
+    prim_lat = geometry.triangular_lattice(150.0)
+    for bad_kwargs in [
+        {'pair_hop_shells': 0},
+        {'pair_hop_shells': 1, 'pair_hop_kernel': 'invalid_kernel'},
+        {'pair_hop_shells': 1, 'pair_hop_scale': -1.0},
+        {'pair_hop_shells': 1, 'pair_hop_scale': np.nan},
+    ]:
+      with self.assertRaises(ValueError):
+        mcmc.mh_pair_interwell_update(
+            params={},
+            f=flat_log_psi,
+            data=data,
+            key=jax.random.PRNGKey(0),
+            lp_1=jnp.zeros((4,)),
+            num_accepts=0.0,
+            pair_lattice=prim_lat,
+            ndim=2,
+            layer_counts=(1, 1),
+            pair_radius=10.0,
+            **bad_kwargs,
+        )
+      with self.assertRaises(ValueError):
+        mcmc.mh_pair_update(
+            params={},
+            f=flat_log_psi,
+            data=data,
+            key=jax.random.PRNGKey(0),
+            lp_1=jnp.zeros((4,)),
+            num_accepts=0.0,
+            pair_lattice=prim_lat,
+            ndim=2,
+            layer_counts=(1, 1),
+            pair_radius=10.0,
+            **bad_kwargs,
+        )
+      with self.assertRaises(ValueError):
+        mcmc.make_mcmc_step(
+            flat_log_psi,
+            batch_per_device=4,
+            steps=2,
+            ndim=2,
+            nspins=(1, 1),
+            pair_prob=0.5,
+            pair_radius=10.0,
+            pair_lattice=prim_lat,
+            **bad_kwargs,
+        )
 
   def test_interwell_pair_hop_zero_pairs_and_periodic_identity_avoid_wrapping_roundoff(
       self,

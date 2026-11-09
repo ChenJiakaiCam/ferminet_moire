@@ -286,6 +286,9 @@ def get_config() -> ml_collections.ConfigDict:
   cfg.mcmc.move_width = 2.0
   cfg.mcmc.pair_prob = 0.5
   cfg.mcmc.pair_radius = 1.5 * 37.79
+  cfg.mcmc.pair_hop_shells = 3
+  cfg.mcmc.pair_hop_kernel = 'gaussian'
+  cfg.mcmc.pair_hop_scale = 1.2
   cfg.network.full_det = True 
   # cfg.network.jastrow = 'bilayer'
   cfg.network.jastrow = 'none'
