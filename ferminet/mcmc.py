@@ -397,33 +397,41 @@ def _find_mutual_eh_pairs(
 def _make_moire_hop_vectors(
     pair_lattice: jnp.ndarray | np.ndarray,
     ndim: int = 2,
+    max_shells: int = 1,
 ) -> jnp.ndarray:
-  """Constructs nearest-neighbor direct lattice translation vectors for inter-well hops.
+  """Constructs direct lattice translation vectors across the first `max_shells` shells.
 
   Given a primitive moire lattice matrix `pair_lattice` of shape `(ndim, ndim)`
   whose columns are the primitive lattice vectors:
     1. LLL-reduces the basis so the basis vectors lie in the first shell.
-    2. Enumerates all non-zero integer combinations `n in {-1, 0, 1}^ndim \\ {0}`
-       and retains the shortest-shell vectors (within relative tolerance 1e-4 of
-       the shortest non-zero lattice vector, plus all unit basis vectors
-       `+/- a_k` so anisotropic/rectangular lattices span every axis).
+    2. Enumerates non-zero integer combinations `n in {-R, ..., R}^ndim \\ {0}`
+       guaranteed to cover the first `max_shells` Euclidean distance shells
+       (with `R = 1` when `max_shells == 1`, and `R = ceil(sqrt(2)*max_shells)+1`
+       when `max_shells > 1`).
+    3. Groups non-zero candidate vectors by Euclidean norm (within relative
+       tolerance 1e-4 of `a_M`) and retains the first `max_shells` shells (plus
+       unit basis vectors `+/- a_k` so anisotropic lattices span every axis).
 
-  For a 2D triangular moire lattice (either 120-degree or 60-degree basis), this
-  returns the exact 6 nearest-neighbor moire lattice vectors of length `a_M`
-  (`{+/- a_1, +/- a_2, +/-(a_1 + a_2)}` or `{+/- a_1, +/- a_2, +/-(a_2 - a_1)}`).
-  Because both the L1 integer norm and Euclidean vector norm are invariant under
-  `n -> -n`, opposite directions `+a` and `-a` are always included in pairs and
-  sampled with equal probability.
+  For a 2D triangular moire lattice with `max_shells = 3`, this returns the 18
+  moire lattice vectors spanning Shell 1 (`||R|| = a_M`, 6 vectors), Shell 2
+  (`||R|| = sqrt(3) * a_M`, 6 vectors), and Shell 3 (`||R|| = 2 * a_M`, 6
+  vectors). Because both the integer grid and Euclidean vector norm are
+  invariant under `n -> -n`, opposite directions `+R` and `-R` are always
+  included in pairs with identical norms.
 
   Args:
     pair_lattice: Shape `(ndim, ndim)` matrix with direct lattice vectors as
       columns.
     ndim: Spatial dimensionality.
+    max_shells: Number of non-zero Euclidean distance shells to include (>= 1).
 
   Returns:
-    Float32 JAX array of shape `(n_vectors, ndim)` containing the nearest-neighbor
+    Float32 JAX array of shape `(n_vectors, ndim)` containing the candidate
     lattice translation vectors as rows.
   """
+  max_shells = int(max_shells)
+  if max_shells < 1:
+    raise ValueError(f'max_shells must be >= 1, got {max_shells}.')
   lat_np = np.asarray(pair_lattice, dtype=np.float64)
   if lat_np.shape != (ndim, ndim):
     raise ValueError(
@@ -435,42 +443,159 @@ def _make_moire_hop_vectors(
     raise ValueError('pair_lattice must be non-singular.')
 
   reduced_np = _lll_reduced_basis(lat_np)
-  grid = np.meshgrid(
-      *[np.array([-1, 0, 1], dtype=np.int64) for _ in range(ndim)],
-      indexing='ij',
-  )
+  if max_shells == 1:
+    grid_radius = 1
+  else:
+    min_basis_norm = float(np.min(np.linalg.norm(reduced_np, axis=0)))
+    inv_row_norms = np.linalg.norm(np.linalg.inv(reduced_np), axis=1)
+    exact_bound = int(
+        np.ceil(max_shells * min_basis_norm * float(np.max(inv_row_norms)))
+    )
+    grid_radius = max(2, exact_bound + 1)
+  coords_1d = np.arange(-grid_radius, grid_radius + 1, dtype=np.int64)
+  grid = np.meshgrid(*[coords_1d for _ in range(ndim)], indexing='ij')
   point_list = np.stack([g.ravel() for g in grid], axis=-1)
   nonzero_mask = np.any(point_list != 0, axis=-1)
   point_list = point_list[nonzero_mask]
 
-  candidates = point_list @ reduced_np.T  # (3^ndim - 1, ndim)
+  candidates = point_list @ reduced_np.T
   norms = np.linalg.norm(candidates, axis=-1)
   min_norm = float(np.min(norms))
+  shell_tol = min_norm * 1e-4
+
+  sorted_norms = np.sort(norms)
+  shell_radii = [float(sorted_norms[0])]
+  for r in sorted_norms[1:]:
+    if len(shell_radii) >= max_shells:
+      break
+    if float(r) > shell_radii[-1] + shell_tol:
+      shell_radii.append(float(r))
+
+  max_shell_radius = shell_radii[-1] + shell_tol
   is_basis_axis = np.sum(np.abs(point_list), axis=-1) == 1
-  is_first_shell = norms <= min_norm * (1.0 + 1e-4)
-  keep_mask = is_basis_axis | is_first_shell
-  hop_vectors_np = candidates[keep_mask]
+  in_shells = norms <= max_shell_radius
+  keep_mask = (is_basis_axis | in_shells) if max_shells == 1 else in_shells
+  kept_candidates = candidates[keep_mask]
+  if max_shells > 1:
+    kept_norms = norms[keep_mask]
+    shell_idx = np.searchsorted(
+        np.asarray(shell_radii, dtype=np.float64) + shell_tol, kept_norms
+    )
+    shell_order = np.argsort(shell_idx, kind='stable')
+    hop_vectors_np = kept_candidates[shell_order]
+  else:
+    hop_vectors_np = kept_candidates
   return jnp.asarray(hop_vectors_np, dtype=jnp.float32)
+
+
+def _validate_pair_hop_config(
+    pair_hop_shells: int,
+    pair_hop_kernel: str,
+    pair_hop_scale: float,
+) -> tuple[int, str, float]:
+  """Validates `pair_hop_shells`, `pair_hop_kernel`, and `pair_hop_scale`."""
+  shells = int(pair_hop_shells)
+  if shells < 1:
+    raise ValueError(f'pair_hop_shells must be >= 1, got {pair_hop_shells}.')
+  kernel = str(pair_hop_kernel).strip().lower()
+  if kernel not in ('gaussian', 'exponential', 'uniform'):
+    raise ValueError(
+        "pair_hop_kernel must be one of 'gaussian', 'exponential', or "
+        f"'uniform', got {pair_hop_kernel!r}."
+    )
+  scale = float(pair_hop_scale)
+  if not np.isfinite(scale) or scale <= 0.0:
+    raise ValueError(
+        f'pair_hop_scale must be finite and positive, got {pair_hop_scale}.'
+    )
+  return shells, kernel, scale
+
+
+def _make_moire_hop_distribution(
+    pair_lattice: jnp.ndarray | np.ndarray,
+    ndim: int = 2,
+    max_shells: int = 3,
+    hop_kernel: str = 'gaussian',
+    hop_scale: float = 1.2,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+  """Constructs multi-shell moire lattice hop vectors and radial selection probabilities.
+
+  Assigns each candidate lattice translation `R_m` in the first `max_shells`
+  shells of `pair_lattice` a probability `p_m = w(||R_m||) / sum_k w(||R_k||)`:
+    - `'gaussian'`: `w(r) = exp(-r^2 / (2 * (hop_scale * a_M)^2))`
+    - `'exponential'`: `w(r) = exp(-r / (hop_scale * a_M))`
+    - `'uniform'`: `w(r) = 1`
+  where `a_M = min_m ||R_m||` is the first-shell moire lattice constant.
+  Because `||-R_m|| = ||R_m||`, opposite lattice translations `+R_m` and `-R_m`
+  have identical selection probabilities `p(+R_m) = p(-R_m)`, preserving exact
+  detailed balance with standard Metropolis acceptance `min(1, |Psi(X')|^2 / |Psi(X)|^2)`.
+
+  Args:
+    pair_lattice: Shape `(ndim, ndim)` primitive moire lattice matrix.
+    ndim: Spatial dimensionality.
+    max_shells: Number of non-zero Euclidean shells to include (>= 1).
+    hop_kernel: Radial weighting kernel (`'gaussian'`, `'exponential'`, or
+      `'uniform'`).
+    hop_scale: Positive dimensionless decay length in units of `a_M`
+      (`sigma_hop / a_M` for `'gaussian'`, `ell_hop / a_M` for `'exponential'`).
+
+  Returns:
+    Tuple `(hop_vectors, hop_probs)` of `jnp.float32` arrays with shapes
+    `(n_vectors, ndim)` and `(n_vectors,)`.
+  """
+  max_shells, kernel, hop_scale = _validate_pair_hop_config(
+      max_shells, hop_kernel, hop_scale
+  )
+
+  hop_vectors = _make_moire_hop_vectors(
+      pair_lattice, ndim=ndim, max_shells=max_shells
+  )
+  vecs_np = np.asarray(hop_vectors, dtype=np.float64)
+  norms = np.linalg.norm(vecs_np, axis=-1)
+  a_m = float(np.min(norms))
+
+  if kernel == 'gaussian':
+    sigma = hop_scale * a_m
+    log_w = -0.5 * (norms / sigma) ** 2
+  elif kernel == 'exponential':
+    ell = hop_scale * a_m
+    log_w = -(norms / ell)
+  else:
+    log_w = np.zeros_like(norms)
+
+  log_w = log_w - np.max(log_w)
+  w = np.maximum(np.exp(log_w), float(np.finfo(np.float32).tiny))
+  probs_np = w / np.sum(w)
+  return (
+      jnp.asarray(vecs_np, dtype=jnp.float32),
+      jnp.asarray(probs_np, dtype=jnp.float32),
+  )
 
 
 def _validate_hop_vectors(
     hop_vectors: jnp.ndarray | np.ndarray,
     ndim: int = 2,
     atol: float = 1e-5,
-) -> jnp.ndarray:
-  """Validates custom hop vectors for shape, finiteness, and +/- symmetry.
+    hop_probs: jnp.ndarray | np.ndarray | None = None,
+) -> jnp.ndarray | tuple[jnp.ndarray, jnp.ndarray]:
+  """Validates custom hop vectors (and optional probabilities) for +/- symmetry.
 
   To preserve detailed balance without a Hastings proposal-ratio correction,
-  every hop vector `+a` must appear with the exact same multiplicity as its
-  reverse `-a` (and be non-zero and finite).
+  every hop direction `+a` must have equal total selection probability to its
+  reverse `-a`.
 
   Args:
     hop_vectors: Array of shape `(n_vectors, ndim)`.
     ndim: Spatial dimensionality.
-    atol: Tolerance for matching opposite vectors `+a` and `-a`.
+    atol: Relative tolerance for matching opposite vectors `+a` and `-a` and
+      their selection probabilities.
+    hop_probs: Optional 1D probability array of shape `(n_vectors,)`. When
+      provided, returns `(validated_vectors, validated_probs)`.
 
   Returns:
-    Validated `jnp.float32` array of shape `(n_vectors, ndim)`.
+    Validated `jnp.float32` array of shape `(n_vectors, ndim)` when
+    `hop_probs is None`, or tuple `(validated_vectors, validated_probs)` when
+    `hop_probs is not None`.
   """
   if isinstance(hop_vectors, jax.core.Tracer):
     if hop_vectors.ndim != 2 or hop_vectors.shape[1] != ndim or hop_vectors.shape[0] == 0:
@@ -478,7 +603,17 @@ def _validate_hop_vectors(
           f'hop_vectors must have shape (n_vectors >= 1, {ndim}), got '
           f'{hop_vectors.shape}.'
       )
-    return jnp.asarray(hop_vectors, dtype=jnp.float32)
+    vecs_out = jnp.asarray(hop_vectors, dtype=jnp.float32)
+    if hop_probs is None:
+      return vecs_out
+    probs_out = jnp.asarray(hop_probs, dtype=jnp.float32)
+    if probs_out.shape != (hop_vectors.shape[0],):
+      raise ValueError(
+          f'hop_probs must have shape ({hop_vectors.shape[0]},), got '
+          f'{probs_out.shape}.'
+      )
+    probs_out = probs_out / jnp.sum(probs_out)
+    return vecs_out, probs_out
 
   vecs_np = np.asarray(hop_vectors, dtype=np.float64)
   if vecs_np.ndim != 2 or vecs_np.shape[1] != ndim or vecs_np.shape[0] == 0:
@@ -495,26 +630,52 @@ def _validate_hop_vectors(
         f'{float(np.min(norms)):.3e}.'
     )
   n_vecs = vecs_np.shape[0]
-  matched = np.zeros(n_vecs, dtype=bool)
+  if hop_probs is not None:
+    probs_np = np.asarray(hop_probs, dtype=np.float64)
+    if probs_np.shape != (n_vecs,):
+      raise ValueError(
+          f'hop_probs must have shape ({n_vecs},), got {probs_np.shape}.'
+      )
+    if not np.all(np.isfinite(probs_np)) or np.any(probs_np <= 0.0):
+      raise ValueError('hop_probs must contain finite, strictly positive values.')
+    prob_sum = float(np.sum(probs_np))
+    if abs(prob_sum - 1.0) > 1e-3:
+      raise ValueError(
+          f'hop_probs must sum to 1.0, got sum(hop_probs)={prob_sum:.6f}.'
+      )
+    probs_np = probs_np / prob_sum
+  else:
+    probs_np = np.full(n_vecs, 1.0 / float(n_vecs), dtype=np.float64)
+
+  checked = np.zeros(n_vecs, dtype=bool)
   for idx in range(n_vecs):
-    if matched[idx]:
+    if checked[idx]:
       continue
     v = vecs_np[idx]
     tol = atol * max(1.0, float(norms[idx]))
-    partner_idx = -1
-    for jdx in range(idx + 1, n_vecs):
-      if not matched[jdx] and np.linalg.norm(v + vecs_np[jdx]) <= tol:
-        partner_idx = jdx
-        break
-    if partner_idx < 0:
+    same_mask = np.linalg.norm(vecs_np - v[None, :], axis=-1) <= tol
+    opp_mask = np.linalg.norm(vecs_np + v[None, :], axis=-1) <= tol
+    if not np.any(opp_mask):
       raise ValueError(
           'hop_vectors must be symmetric under negation (+a and -a with '
-          f'equal multiplicity); no unmatched opposite vector found for '
+          'equal selection probability); no opposite vector found for '
           f'hop_vectors[{idx}] = {v.tolist()}.'
       )
-    matched[idx] = True
-    matched[partner_idx] = True
-  return jnp.asarray(vecs_np, dtype=jnp.float32)
+    p_pos = float(np.sum(probs_np[same_mask]))
+    p_neg = float(np.sum(probs_np[opp_mask]))
+    if abs(p_pos - p_neg) > atol * max(p_pos, p_neg, 1e-12):
+      raise ValueError(
+          'hop_vectors must be symmetric under negation (+a and -a with '
+          'equal selection probability); mismatched probabilities '
+          f'P(+a)={p_pos:.6g} vs P(-a)={p_neg:.6g} for '
+          f'hop_vectors[{idx}] = {v.tolist()}.'
+      )
+    checked[same_mask | opp_mask] = True
+
+  vecs_out = jnp.asarray(vecs_np, dtype=jnp.float32)
+  if hop_probs is None:
+    return vecs_out
+  return vecs_out, jnp.asarray(probs_np, dtype=jnp.float32)
 
 
 def _mh_pair_interwell_update_with_diagnostics(
@@ -525,6 +686,7 @@ def _mh_pair_interwell_update_with_diagnostics(
     lp_1: Any,
     num_accepts: Any,
     hop_vectors: jnp.ndarray,
+    hop_probs: jnp.ndarray | None = None,
     atoms: Any = None,
     ndim: int = 2,
     map_to_cell: Callable[[jnp.ndarray], jnp.ndarray] = lambda x: x,
@@ -551,9 +713,9 @@ def _mh_pair_interwell_update_with_diagnostics(
     2. Selects ONE matched pair `(i*, j*)` uniformly at random among the
        `K(X)` mutual pairs currently present in the walker (and active state if
        `num_states > 1`).
-    3. Selects ONE nearest-neighbor moire lattice translation vector `a`
-       uniformly at random from `hop_vectors` (where `+a` and `-a` have equal
-       probability).
+    3. Selects ONE moire lattice translation vector `a` from `hop_vectors`
+       according to `hop_probs` (or uniformly when `hop_probs` is None), where
+       `+a` and `-a` have equal selection probability `p(+a) = p(-a)`.
     4. Proposes `r_e[i*]' = r_e[i*] + a` and `r_h[j*]' = r_h[j*] + a`, leaving
        all other `N_e + N_h - 2` particles strictly fixed, and wraps positions
        into the simulation cell via `map_to_cell`.
@@ -562,9 +724,9 @@ def _mh_pair_interwell_update_with_diagnostics(
        `partner_h_2 == partner_h_1` implies `K(X') = K(X)` and `(i*, j*)`
        remains a mutual pair in `X'`, the reverse move `X' -> X` selects the
        same pair `(i*, j*)` with probability `1 / K(X)` and the opposite lattice
-       vector `-a` with probability `1 / len(hop_vectors)`, ensuring exact
-       proposal symmetry `q(X' | X) = q(X | X')` and standard Metropolis
-       acceptance `min(1, |Psi(X')|^2 / |Psi(X)|^2)`.
+       vector `-a` with probability `p(-a) = p(+a)`, ensuring exact proposal
+       symmetry `q(X' | X) = q(X | X')` and standard Metropolis acceptance
+       `min(1, |Psi(X')|^2 / |Psi(X)|^2)`.
   """
   if atoms is not None:
     raise NotImplementedError(
@@ -618,12 +780,21 @@ def _mh_pair_interwell_update_with_diagnostics(
       jnp.arange(n_h, dtype=chosen_h_idx.dtype)[None, :] == chosen_h_idx[:, None]
   )
 
-  # Uniformly select 1 nearest-neighbor moire lattice vector per walker/state.
+  # Select 1 moire lattice vector per walker/state according to hop_probs
+  # (or uniformly when hop_probs is None).
   hop_vecs = jnp.asarray(hop_vectors, dtype=x1.dtype)
   n_vecs = hop_vecs.shape[0]
-  vec_idx = jax.random.randint(
-      subkey_vec, shape=(total_states,), minval=0, maxval=n_vecs
-  )
+  if hop_probs is None:
+    vec_idx = jax.random.randint(
+        subkey_vec, shape=(total_states,), minval=0, maxval=n_vecs
+    )
+  else:
+    vec_idx = jax.random.choice(
+        subkey_vec,
+        n_vecs,
+        shape=(total_states,),
+        p=jnp.asarray(hop_probs, dtype=jnp.float32),
+    )
   hop_vec = hop_vecs[vec_idx]  # (total_states, ndim)
 
   eta_e = jnp.where(selected_e_mask[..., None], hop_vec[:, None, :], 0.0)
@@ -734,6 +905,10 @@ def mh_pair_interwell_update(
     num_accepts: Any,
     pair_lattice: jnp.ndarray | np.ndarray | None = None,
     hop_vectors: jnp.ndarray | np.ndarray | None = None,
+    hop_probs: jnp.ndarray | np.ndarray | None = None,
+    pair_hop_shells: int = 1,
+    pair_hop_kernel: str = 'gaussian',
+    pair_hop_scale: float = 1.2,
     atoms: Any = None,
     ndim: int = 2,
     map_to_cell: Callable[[jnp.ndarray], jnp.ndarray] = lambda x: x,
@@ -747,19 +922,40 @@ def mh_pair_interwell_update(
   """Performs one Metropolis-Hastings inter-well pair hop by a moire lattice vector.
 
   Selects one mutual nearest-neighbor (e, h) pair uniformly at random per walker
-  and translates both particles by a randomly chosen nearest-neighbor moire
-  lattice vector `a` from `hop_vectors` (or derived from `pair_lattice`),
-  leaving all other particles fixed. Enforces exact detailed balance via full
-  mutual-nearest-neighbor pairing-map preservation (`partner_h_2 == partner_h_1`).
+  and translates both particles by a randomly chosen moire lattice vector `a`
+  from `hop_vectors` (or derived from `pair_lattice` across the first
+  `pair_hop_shells` shells with radial kernel `pair_hop_kernel` and width
+  `pair_hop_scale * a_M`), leaving all other particles fixed. Enforces exact
+  detailed balance via full mutual-nearest-neighbor pairing-map preservation
+  (`partner_h_2 == partner_h_1`).
   """
   if hop_vectors is None:
     if pair_lattice is None:
       raise ValueError(
           'mh_pair_interwell_update requires either pair_lattice or hop_vectors.'
       )
-    resolved_hop_vecs = _make_moire_hop_vectors(pair_lattice, ndim=ndim)
-  else:
+    if hop_probs is not None:
+      raise ValueError('hop_probs requires explicit hop_vectors.')
+    resolved_hop_vecs, cand_probs = _make_moire_hop_distribution(
+        pair_lattice,
+        ndim=ndim,
+        max_shells=pair_hop_shells,
+        hop_kernel=pair_hop_kernel,
+        hop_scale=pair_hop_scale,
+    )
+    cand_probs_np = np.asarray(cand_probs, dtype=np.float64)
+    resolved_hop_probs = (
+        None
+        if np.allclose(cand_probs_np, cand_probs_np[0], rtol=1e-5, atol=0.0)
+        else cand_probs
+    )
+  elif hop_probs is None:
     resolved_hop_vecs = _validate_hop_vectors(hop_vectors, ndim=ndim)
+    resolved_hop_probs = None
+  else:
+    resolved_hop_vecs, resolved_hop_probs = _validate_hop_vectors(
+        hop_vectors, ndim=ndim, hop_probs=hop_probs
+    )
 
   out = _mh_pair_interwell_update_with_diagnostics(
       params=params,
@@ -769,6 +965,7 @@ def mh_pair_interwell_update(
       lp_1=lp_1,
       num_accepts=num_accepts,
       hop_vectors=resolved_hop_vecs,
+      hop_probs=resolved_hop_probs,
       atoms=atoms,
       ndim=ndim,
       map_to_cell=map_to_cell,
@@ -802,6 +999,10 @@ def _mh_pair_update_with_diagnostics(
     unpaired_stddev: float | jnp.ndarray | None = None,
     pair_lattice: jnp.ndarray | np.ndarray | None = None,
     hop_vectors: jnp.ndarray | np.ndarray | None = None,
+    hop_probs: jnp.ndarray | np.ndarray | None = None,
+    pair_hop_shells: int = 1,
+    pair_hop_kernel: str = 'gaussian',
+    pair_hop_scale: float = 1.2,
 ) -> tuple[
     networks.FermiNetData,
     chex.PRNGKey,
@@ -838,11 +1039,30 @@ def _mh_pair_update_with_diagnostics(
     return (out_data, out_key, out_lp, out_acc, zero, zero, zero, zero)
 
   if hop_vectors is not None or pair_lattice is not None:
-    resolved_hop_vecs = (
-        _validate_hop_vectors(hop_vectors, ndim=ndim)
-        if hop_vectors is not None
-        else _make_moire_hop_vectors(pair_lattice, ndim=ndim)  # type: ignore[arg-type]
-    )
+    if hop_vectors is not None:
+      if hop_probs is None:
+        resolved_hop_vecs = _validate_hop_vectors(hop_vectors, ndim=ndim)
+        resolved_hop_probs = None
+      else:
+        resolved_hop_vecs, resolved_hop_probs = _validate_hop_vectors(
+            hop_vectors, ndim=ndim, hop_probs=hop_probs
+        )
+    else:
+      if hop_probs is not None:
+        raise ValueError('hop_probs requires explicit hop_vectors.')
+      resolved_hop_vecs, cand_probs = _make_moire_hop_distribution(
+          pair_lattice,  # type: ignore[arg-type]
+          ndim=ndim,
+          max_shells=pair_hop_shells,
+          hop_kernel=pair_hop_kernel,
+          hop_scale=pair_hop_scale,
+      )
+      cand_probs_np = np.asarray(cand_probs, dtype=np.float64)
+      resolved_hop_probs = (
+          None
+          if np.allclose(cand_probs_np, cand_probs_np[0], rtol=1e-5, atol=0.0)
+          else cand_probs
+      )
     return _mh_pair_interwell_update_with_diagnostics(
         params=params,
         f=f,
@@ -851,6 +1071,7 @@ def _mh_pair_update_with_diagnostics(
         lp_1=lp_1,
         num_accepts=num_accepts,
         hop_vectors=resolved_hop_vecs,
+        hop_probs=resolved_hop_probs,
         atoms=atoms,
         ndim=ndim,
         map_to_cell=map_to_cell,
@@ -997,6 +1218,10 @@ def mh_pair_update(
     unpaired_stddev: float | jnp.ndarray | None = ...,
     pair_lattice: jnp.ndarray | np.ndarray | None = ...,
     hop_vectors: jnp.ndarray | np.ndarray | None = ...,
+    hop_probs: jnp.ndarray | np.ndarray | None = ...,
+    pair_hop_shells: int = ...,
+    pair_hop_kernel: str = ...,
+    pair_hop_scale: float = ...,
     return_pair_diagnostics: Literal[False] = ...,
 ) -> tuple[networks.FermiNetData, chex.PRNGKey, jnp.ndarray, jnp.ndarray]:
   ...
@@ -1022,6 +1247,10 @@ def mh_pair_update(
     unpaired_stddev: float | jnp.ndarray | None = ...,
     pair_lattice: jnp.ndarray | np.ndarray | None = ...,
     hop_vectors: jnp.ndarray | np.ndarray | None = ...,
+    hop_probs: jnp.ndarray | np.ndarray | None = ...,
+    pair_hop_shells: int = ...,
+    pair_hop_kernel: str = ...,
+    pair_hop_scale: float = ...,
     *,
     return_pair_diagnostics: Literal[True],
 ) -> tuple[
@@ -1056,6 +1285,10 @@ def mh_pair_update(
     unpaired_stddev: float | jnp.ndarray | None = None,
     pair_lattice: jnp.ndarray | np.ndarray | None = None,
     hop_vectors: jnp.ndarray | np.ndarray | None = None,
+    hop_probs: jnp.ndarray | np.ndarray | None = None,
+    pair_hop_shells: int = 1,
+    pair_hop_kernel: str = 'gaussian',
+    pair_hop_scale: float = 1.2,
     return_pair_diagnostics: bool = False,
 ):
   """Performs one Metropolis-Hastings step shifting bound (e, h) pairs together.
@@ -1063,13 +1296,14 @@ def mh_pair_update(
   When `pair_lattice` or `hop_vectors` is provided (the default in moire
   bilayer systems), performs an explicit inter-well pair hop: selects one
   matched mutual nearest-neighbor (e, h) pair uniformly at random per walker
-  and translates both particles by a randomly chosen nearest-neighbor moire
-  lattice vector while keeping all other particles fixed. When neither
-  `pair_lattice` nor `hop_vectors` is provided, falls back to shifting mutual
-  nearest-neighbor pairs by Gaussian displacements of width `stddev`. Exact
-  detailed balance is enforced in both modes by requiring the mutual
-  nearest-neighbor pairing map within `pair_radius` to be identical in the
-  initial and proposed configurations.
+  and translates both particles by a randomly chosen moire lattice vector
+  (across the first `pair_hop_shells` shells weighted by `pair_hop_kernel`
+  with width `pair_hop_scale * a_M`) while keeping all other particles fixed.
+  When neither `pair_lattice` nor `hop_vectors` is provided, falls back to
+  shifting mutual nearest-neighbor pairs by Gaussian displacements of width
+  `stddev`. Exact detailed balance is enforced in both modes by requiring the
+  mutual nearest-neighbor pairing map within `pair_radius` to be identical in
+  the initial and proposed configurations.
 
   Args:
     params: Wavefunction parameters.
@@ -1091,9 +1325,18 @@ def mh_pair_update(
     unpaired_stddev: Optional width of Gaussian move proposal for unpaired
       particles when `pair_lattice` and `hop_vectors` are None.
     pair_lattice: Optional `(ndim, ndim)` primitive moire lattice matrix whose
-      nearest-neighbor lattice vectors define discrete inter-well pair hops.
+      lattice vectors define discrete inter-well pair hops.
     hop_vectors: Optional `(n_vectors, ndim)` array of explicit inter-well
       lattice translation vectors.
+    hop_probs: Optional `(n_vectors,)` array of selection probabilities for
+      `hop_vectors` (must satisfy `p(+a) = p(-a)`).
+    pair_hop_shells: Number of shortest non-zero Euclidean moire lattice shells
+      included when generating hop vectors from `pair_lattice`. Defaults to 1.
+    pair_hop_kernel: Radial weighting kernel (`'gaussian'`, `'exponential'`, or
+      `'uniform'`) over generated moire lattice hop shells. Defaults to
+      `'gaussian'`.
+    pair_hop_scale: Radial decay length `sigma_hop / a_M` (or `ell_hop / a_M`)
+      in units of the 1st-shell moire lattice constant `a_M`. Defaults to 1.2.
     return_pair_diagnostics: If True, also returns `(num_map_rejects,
       total_pairs, active_pair_tries, active_pair_accepts)` for the step.
 
@@ -1122,6 +1365,10 @@ def mh_pair_update(
       unpaired_stddev=unpaired_stddev,
       pair_lattice=pair_lattice,
       hop_vectors=hop_vectors,
+      hop_probs=hop_probs,
+      pair_hop_shells=pair_hop_shells,
+      pair_hop_kernel=pair_hop_kernel,
+      pair_hop_scale=pair_hop_scale,
   )
   if return_pair_diagnostics:
     return out
@@ -1144,6 +1391,10 @@ def make_mcmc_step(
     pair_min_fraction: float = 2.0 / 3.0,
     pair_lattice: jnp.ndarray | np.ndarray | None = None,
     hop_vectors: jnp.ndarray | np.ndarray | None = None,
+    hop_probs: jnp.ndarray | np.ndarray | None = None,
+    pair_hop_shells: int = 1,
+    pair_hop_kernel: str = 'gaussian',
+    pair_hop_scale: float = 1.2,
     return_stats: bool = False,
 ):
   """Creates the MCMC step function.
@@ -1179,11 +1430,20 @@ def make_mcmc_step(
       that must be bound into mutual nearest-neighbor pairs on average across
       walkers before joint pair sweeps are enabled. Defaults to 2/3.
     pair_lattice: Optional `(ndim, ndim)` primitive moire lattice matrix whose
-      nearest-neighbor lattice vectors define discrete inter-well pair hops
-      (translating one randomly selected matched pair per walker by a nearest-
-      neighbor moire lattice vector while leaving all other particles fixed).
+      lattice vectors define discrete inter-well pair hops (translating one
+      randomly selected matched pair per walker by a moire lattice vector while
+      leaving all other particles fixed).
     hop_vectors: Optional `(n_vectors, ndim)` array of explicit inter-well
       lattice translation vectors.
+    hop_probs: Optional `(n_vectors,)` array of selection probabilities for
+      `hop_vectors` (must satisfy `p(+a) = p(-a)`).
+    pair_hop_shells: Number of shortest non-zero Euclidean moire lattice shells
+      included when generating hop vectors from `pair_lattice`. Defaults to 1.
+    pair_hop_kernel: Radial weighting kernel (`'gaussian'`, `'exponential'`, or
+      `'uniform'`) over generated moire lattice hop shells. Defaults to
+      `'gaussian'`.
+    pair_hop_scale: Radial decay length `sigma_hop / a_M` (or `ell_hop / a_M`)
+      in units of the 1st-shell moire lattice constant `a_M`. Defaults to 1.2.
     return_stats: If True, `mcmc_step` returns `(new_data, stats_dict)` with
       separate ordinary/pair attempt and acceptance counts, acceptance rates,
       pair-map rejection rate, Metropolis rejection rate, and mean number of
@@ -1211,6 +1471,9 @@ def make_mcmc_step(
     raise ValueError(
         f'pair_min_fraction must be in [0, 1], got {pair_min_fraction}.'
     )
+  pair_hop_shells, pair_hop_kernel, pair_hop_scale = _validate_pair_hop_config(
+      pair_hop_shells, pair_hop_kernel, pair_hop_scale
+  )
 
   resolved_layer_counts = _resolve_layer_counts(nspins, layer_counts)
   n_e, n_h = resolved_layer_counts
@@ -1223,20 +1486,60 @@ def make_mcmc_step(
     )
 
   if hop_vectors is not None:
-    validated_hop_vectors = _validate_hop_vectors(hop_vectors, ndim=ndim)
+    if hop_probs is None:
+      validated_hop_vectors = _validate_hop_vectors(hop_vectors, ndim=ndim)
+      validated_hop_probs = None
+    else:
+      validated_hop_vectors, validated_hop_probs = _validate_hop_vectors(
+          hop_vectors, ndim=ndim, hop_probs=hop_probs
+      )
   else:
+    if hop_probs is not None:
+      raise ValueError('hop_probs requires explicit hop_vectors.')
     validated_hop_vectors = None
+    validated_hop_probs = None
 
   if use_pair_moves and (
       validated_hop_vectors is not None or pair_lattice is not None
   ):
-    resolved_hop_vectors = (
-        validated_hop_vectors
-        if validated_hop_vectors is not None
-        else _make_moire_hop_vectors(pair_lattice, ndim=ndim)  # type: ignore[arg-type]
-    )
+    if validated_hop_vectors is not None:
+      resolved_hop_vectors = validated_hop_vectors
+      resolved_hop_probs = validated_hop_probs
+    else:
+      cand_vecs, cand_probs = _make_moire_hop_distribution(
+          pair_lattice,  # type: ignore[arg-type]
+          ndim=ndim,
+          max_shells=pair_hop_shells,
+          hop_kernel=pair_hop_kernel,
+          hop_scale=pair_hop_scale,
+      )
+      cand_vecs_np = np.asarray(cand_vecs, dtype=np.float64)
+      cand_probs_np = np.asarray(cand_probs, dtype=np.float64)
+      if lattice is not None:
+        sim_lat_np = np.asarray(lattice, dtype=np.float64)
+        if (
+            sim_lat_np.shape == (ndim, ndim)
+            and abs(np.linalg.det(sim_lat_np)) > 1e-12
+        ):
+          frac = cand_vecs_np @ np.linalg.inv(sim_lat_np).T
+          non_identity = (
+              np.linalg.norm(frac - np.round(frac), axis=-1) > 1e-4
+          )
+          if np.any(non_identity) and not np.all(non_identity):
+            cand_vecs_np = cand_vecs_np[non_identity]
+            cand_probs_np = cand_probs_np[non_identity]
+            cand_probs_np = cand_probs_np / np.sum(cand_probs_np)
+            cand_vecs = jnp.asarray(cand_vecs_np, dtype=jnp.float32)
+            cand_probs = jnp.asarray(cand_probs_np, dtype=jnp.float32)
+      resolved_hop_vectors = cand_vecs
+      resolved_hop_probs = (
+          None
+          if np.allclose(cand_probs_np, cand_probs_np[0], rtol=1e-5, atol=0.0)
+          else cand_probs
+      )
   else:
     resolved_hop_vectors = None
+    resolved_hop_probs = None
 
   inner_fun = mh_block_update if blocks > 1 else mh_update
 
@@ -1468,6 +1771,7 @@ def make_mcmc_step(
           dist_sq_fn=dist_sq_fn,
           unpaired_stddev=normal_width,
           hop_vectors=resolved_hop_vectors,
+          hop_probs=resolved_hop_probs,
       )
       acc_p = acc_p + jnp.sum(step_acc).astype(jnp.float32)
       try_p = try_p + batch_f

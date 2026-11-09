@@ -837,6 +837,9 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   pair_prob = float(cfg.mcmc.get('pair_prob', 0.0))
   pair_radius = float(cfg.mcmc.get('pair_radius', 0.0))
   pair_lattice = cfg.mcmc.get('pair_lattice', None)
+  pair_hop_shells = int(cfg.mcmc.get('pair_hop_shells', 1))
+  pair_hop_kernel = str(cfg.mcmc.get('pair_hop_kernel', 'gaussian'))
+  pair_hop_scale = float(cfg.mcmc.get('pair_hop_scale', 1.2))
   moire_cfg = cfg.system.get('moire')
   if pair_prob > 0.0 and pair_radius <= 0.0:
     interlayer_d = 0.0
@@ -889,6 +892,9 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
       pair_width_scale=pair_width_scale,
       pair_min_fraction=pair_min_fraction,
       pair_lattice=pair_lattice,
+      pair_hop_shells=pair_hop_shells,
+      pair_hop_kernel=pair_hop_kernel,
+      pair_hop_scale=pair_hop_scale,
       return_stats=use_pair_mcmc,
   )
 
@@ -1081,10 +1087,13 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     use_interwell_pair_hops = pair_lattice is not None
     pair_hop_distance = (
         float(
-            jnp.linalg.norm(
-                mcmc._make_moire_hop_vectors(
-                    pair_lattice, ndim=cfg.system.ndim
-                )[0]
+            jnp.min(
+                jnp.linalg.norm(
+                    mcmc._make_moire_hop_vectors(
+                        pair_lattice, ndim=cfg.system.ndim
+                    ),
+                    axis=-1,
+                )
             )
         )
         if use_interwell_pair_hops

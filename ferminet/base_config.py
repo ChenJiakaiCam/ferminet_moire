@@ -254,10 +254,23 @@ def default() -> ml_collections.ConfigDict:
           # defaults to 1.5 * interlayer_distance.
           'pair_radius': 0.0,
           # Optional (ndim, ndim) primitive lattice matrix (columns are direct
-          # lattice vectors) defining nearest-neighbor inter-well pair-hop
-          # translations. When None in a moire bilayer system, defaults to the
-          # 1x1 primitive moire lattice (moire_lattice).
+          # lattice vectors) defining inter-well pair-hop translations. When
+          # None in a moire bilayer system, defaults to the 1x1 primitive moire
+          # lattice (moire_lattice).
           'pair_lattice': None,
+          # Number of non-zero moire lattice shells included as candidate
+          # translations in discrete inter-well pair hopping (defaults to 1 for
+          # nearest-neighbor hops only; set to 3 to include the 1*a_M,
+          # sqrt(3)*a_M, and 2*a_M shells on a triangular lattice).
+          'pair_hop_shells': 1,
+          # Radial distance-suppression kernel over candidate moire lattice
+          # vectors: 'gaussian' (exp(-r^2 / (2 * sigma_hop^2))), 'exponential'
+          # (exp(-r / ell_hop)), or 'uniform'.
+          'pair_hop_kernel': 'gaussian',
+          # Dimensionless decay length scale (sigma_hop / a_M for 'gaussian', or
+          # ell_hop / a_M for 'exponential') in units of the shortest moire
+          # lattice vector a_M. Kept fixed during training.
+          'pair_hop_scale': 1.2,
           # Multiplicative scale factor applied to the MCMC move width during
           # fallback Gaussian joint electron-hole pair moves when pair_lattice
           # is None.
