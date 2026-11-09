@@ -947,6 +947,16 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
   else:
     local_energy = local_energy_fn
 
+  from ferminet.moire import geometry as moire_geometry  # pylint: disable=g-import-not-at-top
+  energy_scale = moire_geometry.resolve_moire_energy_scale(cfg)
+  if energy_scale != 1.0 and is_host_zero:
+    logging.info(
+        'Scaling optimization objective by energy_scale=%0.6e E_h '
+        '(1 / energy_scale = %0.6e E_h^-1)',
+        energy_scale,
+        1.0 / energy_scale,
+    )
+
   if cfg.optim.objective == 'vmc':
     evaluate_loss = qmc_loss_functions.make_loss(
         log_network if use_complex else logabs_network,  # pyrefly: ignore[bad-argument-type]
@@ -956,6 +966,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         center_at_clipped_energy=cfg.optim.center_at_clip,
         complex_output=use_complex,
         max_vmap_batch_size=cfg.optim.get('max_vmap_batch_size', 0),
+        energy_scale=energy_scale,
     )
   elif cfg.optim.objective == 'wqmc':
     evaluate_loss = qmc_loss_functions.make_wqmc_loss(
@@ -966,7 +977,8 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         center_at_clipped_energy=cfg.optim.center_at_clip,
         complex_output=use_complex,
         max_vmap_batch_size=cfg.optim.get('max_vmap_batch_size', 0),
-        vmc_weight=cfg.optim.get('vmc_weight', 1.0)
+        vmc_weight=cfg.optim.get('vmc_weight', 1.0),
+        energy_scale=energy_scale,
     )
   elif cfg.optim.objective == 'vmc_overlap':
     if not cfg.system.states:
@@ -986,7 +998,9 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         overlap_penalty=cfg.optim.overlap.penalty,
         overlap_weight=overlap_weight,
         complex_output=cfg.network.get('complex', False),
-        max_vmap_batch_size=cfg.optim.get('max_vmap_batch_size', 0))
+        max_vmap_batch_size=cfg.optim.get('max_vmap_batch_size', 0),
+        energy_scale=energy_scale,
+    )
   else:
     raise ValueError(f'Not a recognized objective: {cfg.optim.objective}')
 
@@ -1186,7 +1200,15 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
     sharded_key, subkeys = kfac_jax.utils.p_split(sharded_key)
     ptotal_energy = constants.pmap(evaluate_loss)
     initial_energy, _ = ptotal_energy(params, subkeys, data)
-    logging.info('Initial energy: %03.4f E_h', initial_energy[0])
+    if energy_scale == 1.0:
+      logging.info('Initial energy: %03.4f E_h', initial_energy[0])
+    else:
+      logging.info(
+          'Initial energy: %03.4f E_0 (%03.6f E_h, E_0=%0.6e E_h)',
+          initial_energy[0],
+          initial_energy[0] * energy_scale,
+          energy_scale,
+      )
 
   time_of_last_ckpt = time.time()
   weighted_stats = None
@@ -1303,9 +1325,23 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
 
       # Logging
       if t % cfg.log.stats_frequency == 0 and is_host_zero:
-        logging_str = ('Step %05d: '
-                       '%03.4f E_h, exp. variance=%03.4f E_h^2, pmove=%0.2f')
-        logging_args = t, loss, weighted_stats.variance, pmove
+        if energy_scale == 1.0:
+          logging_str = (
+              'Step %05d: %03.4f E_h, exp. variance=%03.4f E_h^2, pmove=%0.2f'
+          )
+          logging_args = t, loss, weighted_stats.variance, pmove
+        else:
+          logging_str = (
+              'Step %05d: %03.4f E_0 (%03.6f E_h), '
+              'exp. variance=%03.4f E_0^2, pmove=%0.2f'
+          )
+          logging_args = (
+              t,
+              loss,
+              loss * energy_scale,
+              weighted_stats.variance,
+              pmove,
+          )
         writer_kwargs = {
             'step': t,
             'energy': np.asarray(loss),

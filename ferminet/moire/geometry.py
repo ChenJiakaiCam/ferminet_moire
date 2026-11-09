@@ -12,6 +12,7 @@ direct lattice vectors ``a_1`` and ``a_2``. Consequently, for a row vector
 """
 
 
+import math
 from typing import Any, Optional, Sequence, Tuple, Union
 
 from ferminet import mcmc
@@ -487,6 +488,244 @@ def apply_moire_unit_cell_config(cfg: Any) -> Any:
     fl_kwargs.pop('unit_cell_matrix', None)
     fl_kwargs.pop('unit_cell_lattice', None)
     cfg.network.make_feature_layer_kwargs = fl_kwargs
+  return cfg
+
+
+def _validate_positive_float(value: object, name: str) -> float:
+  """Validates that ``value`` is a finite positive real scalar (not a bool)."""
+  if isinstance(value, (bool, np.bool_)):
+    raise ValueError(f'{name} must be a positive float, got {value!r}.')
+  try:
+    fval = float(value)  # type: ignore[arg-type]
+  except (TypeError, ValueError) as exc:
+    raise ValueError(f'{name} must be a positive float, got {value!r}.') from exc
+  if not math.isfinite(fval) or fval <= 0.0:
+    raise ValueError(f'{name} must be finite and positive, got {value!r}.')
+  return fval
+
+
+def moire_energy_scale(
+    mass_e: Optional[float] = None,
+    mass_h: Optional[float] = None,
+    moire_period: Optional[float] = None,
+    primitive_lattice: Optional[Array] = None,
+    masses: Optional[Sequence[float]] = None,
+) -> float:
+  r"""Returns the characteristic moire kinetic energy scale in Hartree.
+
+  Evaluates
+
+  .. math::
+      E_M = \frac{\hbar^2}{2 (m_e + m_h) a_M^2}
+
+  in Hartree atomic units (``\hbar = m_0 = 1``, lengths in Bohr, energies in
+  Hartree), where ``m_e, m_h`` are the two layer carrier effective masses in
+  units of ``m_0`` and ``a_M`` is the ``1 x 1`` primitive moire lattice period
+  in Bohr.
+
+  Args:
+    mass_e: Electron (or lower-layer) effective mass ``m_e^* / m_0 > 0``.
+    mass_h: Hole (or upper-layer) effective mass ``m_h^* / m_0 > 0``.
+    moire_period: Primitive moire lattice constant ``a_M > 0`` in Bohr (used
+      when ``primitive_lattice`` is ``None``).
+    primitive_lattice: Optional ``(2, 2)`` primitive moire lattice matrix whose
+      first column vector norm defines ``a_M = ||primitive_lattice[:, 0]||_2``.
+    masses: Optional sequence of effective masses overriding ``(mass_e, mass_h)``.
+      Supports either 2-layer ``(mass_e, mass_h)`` or 4-channel
+      ``(mass_e_up, mass_e_down, mass_h_up, mass_h_down)``.
+
+  Returns:
+    Positive float giving ``1 / (2 * (mass_e + mass_h) * a_M^2)`` in Hartree.
+  """
+  if masses is not None:
+    if isinstance(masses, (str, bytes)) or not hasattr(masses, '__len__'):
+      raise ValueError(f'masses must be a sequence of length 2 or 4, got {masses!r}.')
+    masses_list = list(masses)
+    if len(masses_list) == 2:
+      m_e = _validate_positive_float(masses_list[0], 'masses[0]')
+      m_h = _validate_positive_float(masses_list[1], 'masses[1]')
+    elif len(masses_list) == 4:
+      m_e_up = _validate_positive_float(masses_list[0], 'masses[0]')
+      m_e_down = _validate_positive_float(masses_list[1], 'masses[1]')
+      m_h_up = _validate_positive_float(masses_list[2], 'masses[2]')
+      m_h_down = _validate_positive_float(masses_list[3], 'masses[3]')
+      if not np.isclose(m_e_up, m_e_down, rtol=1e-12, atol=0.0):
+        raise ValueError(
+            '4-channel masses must have equal intra-layer spin masses '
+            f'masses[0]==masses[1], got {masses_list}.'
+        )
+      if not np.isclose(m_h_up, m_h_down, rtol=1e-12, atol=0.0):
+        raise ValueError(
+            '4-channel masses must have equal intra-layer spin masses '
+            f'masses[2]==masses[3], got {masses_list}.'
+        )
+      m_e = m_e_up
+      m_h = m_h_up
+    else:
+      raise ValueError(
+          f'masses must have length 2 or 4, got {masses_list}.'
+      )
+  else:
+    if mass_e is None or mass_h is None:
+      raise ValueError(
+          'Both mass_e and mass_h (or masses) must be provided to compute '
+          'moire_energy_scale.'
+      )
+    m_e = _validate_positive_float(mass_e, 'mass_e')
+    m_h = _validate_positive_float(mass_h, 'mass_h')
+
+  if primitive_lattice is not None:
+    prim = validate_lattice_2d(primitive_lattice, name='primitive_lattice')
+    a_m = _validate_positive_float(
+        float(np.linalg.norm(prim[:, 0])), 'norm(primitive_lattice[:, 0])'
+    )
+  elif moire_period is not None:
+    a_m = _validate_positive_float(moire_period, 'moire_period')
+  else:
+    raise ValueError(
+        'Either moire_period or primitive_lattice must be provided to compute '
+        'moire_energy_scale.'
+    )
+
+  scale = 1.0 / (2.0 * (m_e + m_h) * (a_m ** 2))
+  if not math.isfinite(scale) or scale <= 0.0:
+    raise ValueError(
+        f'Computed moire_energy_scale must be finite and positive, got {scale}.'
+    )
+  return float(scale)
+
+
+def _is_moire_system_config(cfg: Any) -> bool:
+  """Returns whether ``cfg`` describes a moire bilayer calculation."""
+  if cfg is None or 'system' not in cfg or cfg.system is None:
+    return False
+  sys_cfg = cfg.system
+  if 'moire' in sys_cfg and sys_cfg.get('moire') is not None:
+    return True
+  if (
+      sys_cfg.get('make_local_energy_fn')
+      == 'ferminet.moire.hamiltonian.local_energy'
+  ):
+    return True
+  le_kwargs = sys_cfg.get('make_local_energy_kwargs')
+  if le_kwargs and 'moire_lattice' in le_kwargs:
+    return True
+  return False
+
+
+def resolve_moire_energy_scale(cfg: Any) -> float:
+  """Resolves the optimization objective energy scale (in Hartree) from ``cfg``.
+
+  Precedence:
+    1. If ``cfg.optim.energy_scale`` is explicitly set (not ``None``), validates
+       and returns ``float(cfg.optim.energy_scale)``.
+    2. If ``cfg.optim.scale_by_moire_energy`` is ``False`` (the default),
+       returns ``1.0``.
+    3. If ``cfg.optim.scale_by_moire_energy`` is ``True`` and ``cfg`` is a moire
+       bilayer configuration, computes and returns
+       ``hbar^2 / (2 * (mass_e + mass_h) * a_M^2)`` using the ``1 x 1``
+       primitive moire period ``a_M`` (even when an enlarged crystal unit cell
+       ``L_unit`` is used for single-particle PBC features).
+    4. Otherwise (non-moire systems such as molecules, atoms, or HEG), returns
+       ``1.0``.
+
+  Args:
+    cfg: ``ml_collections.ConfigDict`` for a FermiNet calculation.
+
+  Returns:
+    Positive float energy scale in Hartree.
+  """
+  if cfg is None:
+    return 1.0
+
+  optim = cfg.get('optim') if 'optim' in cfg else None
+  scale_flag = False
+  if optim is not None:
+    explicit_scale = optim.get('energy_scale')
+    if explicit_scale is not None:
+      return _validate_positive_float(explicit_scale, 'optim.energy_scale')
+    scale_flag = bool(optim.get('scale_by_moire_energy', False))
+
+  if not scale_flag or not _is_moire_system_config(cfg):
+    return 1.0
+
+  sys_cfg = cfg.system
+  mcfg = sys_cfg.get('moire') if 'moire' in sys_cfg else None
+  le_kwargs = (
+      dict(sys_cfg.get('make_local_energy_kwargs'))
+      if sys_cfg.get('make_local_energy_kwargs') is not None
+      else {}
+  )
+  fl_kwargs = (
+      dict(cfg.network.get('make_feature_layer_kwargs'))
+      if ('network' in cfg and cfg.network is not None and cfg.network.get('make_feature_layer_kwargs') is not None)
+      else {}
+  )
+
+  masses = None
+  mass_e = None
+  mass_h = None
+  if mcfg is not None:
+    masses = mcfg.get('masses') if 'masses' in mcfg else None
+    mass_e = mcfg.get('mass_e') if 'mass_e' in mcfg else None
+    mass_h = mcfg.get('mass_h') if 'mass_h' in mcfg else None
+  if masses is None:
+    masses = le_kwargs.get('masses')
+  if mass_e is None:
+    mass_e = le_kwargs.get('mass_e')
+  if mass_h is None:
+    mass_h = le_kwargs.get('mass_h')
+
+  prim_lat = None
+  moire_period = None
+  if mcfg is not None and mcfg.get('primitive_lattice') is not None:
+    prim_lat = mcfg.get('primitive_lattice')
+  elif mcfg is not None and mcfg.get('lattice_constant') is not None:
+    moire_period = mcfg.get('lattice_constant')
+  elif le_kwargs.get('moire_lattice') is not None:
+    prim_lat = le_kwargs.get('moire_lattice')
+  elif fl_kwargs.get('distance_scale') is not None:
+    moire_period = fl_kwargs.get('distance_scale')
+  elif le_kwargs.get('lattice') is not None:
+    prim_lat = le_kwargs.get('lattice')
+  elif sys_cfg.get('lattice') is not None:
+    prim_lat = sys_cfg.get('lattice')
+
+  return moire_energy_scale(
+      mass_e=mass_e,
+      mass_h=mass_h,
+      moire_period=moire_period,
+      primitive_lattice=prim_lat,
+      masses=masses,
+  )
+
+
+def apply_moire_energy_scale_config(cfg: Any) -> Any:
+  """Populates ``cfg.optim.energy_scale`` for moire bilayer configurations.
+
+  When ``cfg.optim.scale_by_moire_energy`` is ``True`` in a moire bilayer
+  system (or when ``cfg.optim.energy_scale`` is explicitly provided), resolves
+  and validates the characteristic energy scale
+  ``hbar^2 / (2 * (mass_e + mass_h) * a_M^2)``. When
+  ``cfg.optim.scale_by_moire_energy`` is ``False`` (the default) and
+  ``cfg.optim.energy_scale`` is ``None``, ``cfg`` is returned completely
+  unchanged for 100% backward compatibility.
+
+  Args:
+    cfg: ``ml_collections.ConfigDict`` for a FermiNet calculation.
+
+  Returns:
+    The updated ``cfg`` (also modified in place).
+  """
+  if cfg is None or 'optim' not in cfg or cfg.optim is None:
+    return cfg
+  has_explicit = cfg.optim.get('energy_scale') is not None
+  scale_flag = bool(cfg.optim.get('scale_by_moire_energy', False))
+  if not has_explicit and not (scale_flag and _is_moire_system_config(cfg)):
+    return cfg
+  scale = resolve_moire_energy_scale(cfg)
+  with cfg.ignore_type():
+    cfg.optim.energy_scale = float(scale)
   return cfg
 
 
