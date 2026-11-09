@@ -90,6 +90,18 @@ def default() -> ml_collections.ConfigDict:
           # magnitude. Useful for removing non-singlet states from excited
           # state calculations.
           'spin_energy': 0.0,
+          # Characteristic energy scale (in Hartree) by which the optimization
+          # objective (local energy) is divided so that the loss is dimensionless
+          # O(10^1-10^3). When None, defaults to
+          # hbar^2 / (2 * (mass_e + mass_h) * a_M^2) for moire bilayer systems
+          # when scale_by_moire_energy is True, and 1.0 otherwise.
+          'energy_scale': None,
+          # If true, scale the optimization objective in moire bilayer systems by
+          # the characteristic moire kinetic energy scale
+          # hbar^2 / (2 * (mass_e + mass_h) * a_M^2) when energy_scale is None.
+          # Defaults to False for 100% backward compatibility with existing
+          # configs and checkpoints.
+          'scale_by_moire_energy': False,
           # If 'objective' is 'vmc_overlap', these parameters control the
           # penalty term.
           'overlap': {
@@ -388,5 +400,6 @@ def resolve(cfg):
         cfg.system.set_molecule = cfg.system.set_molecule.__name__  # pyrefly: ignore[missing-attribute]
   from ferminet.moire import geometry as moire_geometry  # pylint: disable=g-import-not-at-top
   cfg = moire_geometry.apply_moire_unit_cell_config(cfg)
+  cfg = moire_geometry.apply_moire_energy_scale_config(cfg)
   cfg = cfg.copy_and_resolve_references()
   return cfg
