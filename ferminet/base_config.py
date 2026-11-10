@@ -174,6 +174,14 @@ def default() -> ml_collections.ConfigDict:
           # L_unit (True, matching arXiv:2406.11134 Table S4) or tiles the 1x1
           # primitive moire cell L_prim (False).
           'supercell_in_unit_cells': True,
+          # Optional per-layer carrier charges / types for 2D moire bilayer
+          # systems (e.g. (-1, 1) / 'eh' for electron-hole bilayers or
+          # (-1, -1) / 'ee' for electron-electron bilayers). When None,
+          # defaults to (-1, 1) unchanged for full backward compatibility.
+          'layer_charges': None,
+          'carrier_types': None,
+          'charge_e': None,
+          'charge_h': None,
           # number of spin up, spin-down electrons
           'electrons': tuple(),
           # Dimensionality.
@@ -399,6 +407,7 @@ def resolve(cfg):
       if callable(cfg.system.set_molecule):  # pyrefly: ignore[missing-attribute]
         cfg.system.set_molecule = cfg.system.set_molecule.__name__  # pyrefly: ignore[missing-attribute]
   from ferminet.moire import geometry as moire_geometry  # pylint: disable=g-import-not-at-top
+  cfg = moire_geometry.apply_moire_charges_config(cfg)
   cfg = moire_geometry.apply_moire_unit_cell_config(cfg)
   cfg = moire_geometry.apply_moire_energy_scale_config(cfg)
   cfg = cfg.copy_and_resolve_references()

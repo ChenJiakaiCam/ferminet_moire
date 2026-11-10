@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 
 Array = Union[np.ndarray, jnp.ndarray] #i.e. either numpy or JAX array
+CarrierSpec = Union[int, float, str]
 
 def validate_nonnegative_int(value: object, name: str = 'count') -> int:
   if isinstance(value, (bool, np.bool_)):
@@ -35,6 +36,369 @@ def validate_nonnegative_int(value: object, name: str = 'count') -> int:
   if int_val < 0:
     raise ValueError(f'{name} must be >= 0, got {value!r}.')
   return int_val
+
+
+def resolve_carrier_charge(value: object, name: str = 'charge') -> int:
+  """Resolves a single layer's carrier charge sign in ``{-1, +1}``.
+
+  Accepts either unit charges ``-1`` (electrons) / ``+1`` (holes) or string
+  carrier labels such as ``'e'``, ``'electron'``, ``'electrons'`` (``-> -1``)
+  and ``'h'``, ``'hole'``, ``'holes'`` (``-> +1``).
+
+  Args:
+    value: Carrier charge or label for one layer.
+    name: Parameter name used in error messages.
+
+  Returns:
+    ``-1`` for electrons or ``+1`` for holes.
+
+  Raises:
+    ValueError: If ``value`` does not represent a unit electron or hole charge.
+  """
+  if isinstance(value, (bool, np.bool_)):
+    raise ValueError(
+        f"{name} must be -1/+1 or 'e'/'h', got boolean {value!r}."
+    )
+  if isinstance(value, (int, np.integer)):
+    q = int(value)
+    if q in (-1, 1):
+      return q
+  elif isinstance(value, (float, np.floating)):
+    if np.isfinite(value) and float(value).is_integer():
+      q = int(value)
+      if q in (-1, 1):
+        return q
+  elif isinstance(value, str):
+    key = value.strip().lower()
+    if key in ('e', 'elec', 'electron', 'electrons', '-', '-1', '-1.0', '-e'):
+      return -1
+    if key in (
+        'h',
+        'hole',
+        'holes',
+        '+',
+        '+1',
+        '1',
+        '+1.0',
+        '1.0',
+        '+e',
+    ):
+      return 1
+  raise ValueError(
+      f"{name} must be -1 (electron) or +1 (hole) (or 'e'/'h'), got {value!r}."
+  )
+
+
+def resolve_layer_charges(
+    charges: Optional[Union[Sequence[object], str]] = None,
+    charge_e: Optional[object] = None,
+    charge_h: Optional[object] = None,
+) -> Tuple[int, int]:
+  """Resolves the per-layer carrier charges ``(q_1, q_2)`` in ``{-1, +1}^2``.
+
+  Each layer is restricted to a single carrier type (either electrons with
+  ``q = -1`` or holes with ``q = +1``), supporting:
+    - electron-hole bilayers: ``(-1, +1)`` (default) or ``'eh'`` / ``('e', 'h')``
+    - electron-electron bilayers: ``(-1, -1)`` or ``'ee'`` / ``('e', 'e')``
+    - hole-electron bilayers: ``(+1, -1)`` or ``'he'`` / ``('h', 'e')``
+    - hole-hole bilayers: ``(+1, +1)`` or ``'hh'`` / ``('h', 'h')``
+
+  A 4-element sequence ``(q_1_up, q_1_down, q_2_up, q_2_down)`` is also
+  accepted provided ``q_1_up == q_1_down`` and ``q_2_up == q_2_down``.
+
+  Args:
+    charges: Optional 2-tuple (or 4-tuple) of per-layer charges/labels, or a
+      shorthand string in ``{'eh', 'ee', 'he', 'hh', 'e-h', 'e-e', 'h-e', 'h-h'}``.
+    charge_e: Optional carrier charge/label for layer 1 (defaults to ``-1`` when
+      ``charges`` is None).
+    charge_h: Optional carrier charge/label for layer 2 (defaults to ``+1`` when
+      ``charges`` is None).
+
+  Returns:
+    Tuple ``(q_1, q_2)`` with ``q_1, q_2 in {-1, +1}``.
+  """
+  if charges is not None:
+    if isinstance(charges, str):
+      key = (
+          charges.strip()
+          .lower()
+          .replace('-', '')
+          .replace('_', '')
+          .replace(' ', '')
+      )
+      shorthand = {
+          'eh': (-1, 1),
+          'ee': (-1, -1),
+          'he': (1, -1),
+          'hh': (1, 1),
+      }
+      if key not in shorthand:
+        raise ValueError(
+            "String 'charges' must be one of 'eh', 'ee', 'he', 'hh' "
+            f"(or 'e-h', 'e-e', 'h-e', 'h-h'), got {charges!r}."
+        )
+      q1, q2 = shorthand[key]
+    elif isinstance(charges, (Sequence, np.ndarray)):
+      items = list(charges)
+      if len(items) == 2:
+        q1 = resolve_carrier_charge(items[0], 'charges[0]')
+        q2 = resolve_carrier_charge(items[1], 'charges[1]')
+      elif len(items) == 4:
+        q1_up = resolve_carrier_charge(items[0], 'charges[0]')
+        q1_dn = resolve_carrier_charge(items[1], 'charges[1]')
+        q2_up = resolve_carrier_charge(items[2], 'charges[2]')
+        q2_dn = resolve_carrier_charge(items[3], 'charges[3]')
+        if q1_up != q1_dn or q2_up != q2_dn:
+          raise ValueError(
+              'Each layer must contain only a single carrier type (either '
+              f'electrons or holes); got 4-channel charges {charges!r} with '
+              f'layer 1 ({q1_up}, {q1_dn}) and layer 2 ({q2_up}, {q2_dn}).'
+          )
+        q1, q2 = q1_up, q2_up
+      else:
+        raise ValueError(
+            'Expected charges to have length 2 (q_layer1, q_layer2) or '
+            f'length 4, got {charges!r}.'
+        )
+    else:
+      raise ValueError(
+          'Expected charges to be a 2-tuple of (-1, +1) or carrier type '
+          f'strings, got {charges!r}.'
+      )
+    if charge_e is not None:
+      q1_override = resolve_carrier_charge(charge_e, 'charge_e')
+      if q1_override != q1:
+        raise ValueError(
+            f'Conflicting layer 1 charge specifications: charges={charges!r} '
+            f'vs charge_e={charge_e!r}.'
+        )
+    if charge_h is not None:
+      q2_override = resolve_carrier_charge(charge_h, 'charge_h')
+      if q2_override != q2:
+        raise ValueError(
+            f'Conflicting layer 2 charge specifications: charges={charges!r} '
+            f'vs charge_h={charge_h!r}.'
+        )
+    return q1, q2
+
+  q1 = -1 if charge_e is None else resolve_carrier_charge(charge_e, 'charge_e')
+  q2 = 1 if charge_h is None else resolve_carrier_charge(charge_h, 'charge_h')
+  return q1, q2
+
+
+def resolve_moire_charges_from_config(
+    mcfg: Any,
+    syscfg: Any = None,
+) -> Tuple[int, int]:
+  """Resolves per-layer carrier charges ``(charge_e, charge_h)`` from config."""
+  charges_spec = None
+  charge_e = None
+  charge_h = None
+
+  if syscfg is not None:
+    charges_spec = syscfg.get('layer_charges', None)
+    if charges_spec is None:
+      charges_spec = syscfg.get('carrier_types', None)
+    if charges_spec is None:
+      charges_spec = syscfg.get('charges', None)
+    charge_e = syscfg.get('charge_e', None)
+    if charge_e is None:
+      charge_e = syscfg.get('charge_1', None)
+    charge_h = syscfg.get('charge_h', None)
+    if charge_h is None:
+      charge_h = syscfg.get('charge_2', None)
+
+  if mcfg is not None:
+    if charges_spec is None:
+      charges_spec = mcfg.get('layer_charges', None)
+    if charges_spec is None:
+      charges_spec = mcfg.get('carrier_types', None)
+    if charges_spec is None:
+      charges_spec = mcfg.get('charges', None)
+    if charge_e is None:
+      charge_e = mcfg.get('charge_e', None)
+    if charge_e is None:
+      charge_e = mcfg.get('charge_1', None)
+    if charge_h is None:
+      charge_h = mcfg.get('charge_h', None)
+    if charge_h is None:
+      charge_h = mcfg.get('charge_2', None)
+
+  # Allow charge_e / charge_h to override the default charges=(-1, 1) when
+  # layer_charges / carrier_types were not explicitly set.
+  is_default_charges = (
+      isinstance(charges_spec, (tuple, list))
+      and len(charges_spec) == 2
+      and tuple(charges_spec) == (-1, 1)
+  )
+  has_explicit_layer_charges = (
+      (syscfg is not None and (
+          syscfg.get('layer_charges', None) is not None
+          or syscfg.get('carrier_types', None) is not None
+      ))
+      or (mcfg is not None and (
+          mcfg.get('layer_charges', None) is not None
+          or mcfg.get('carrier_types', None) is not None
+      ))
+  )
+  if (
+      (charge_e is not None or charge_h is not None)
+      and not has_explicit_layer_charges
+      and is_default_charges
+  ):
+    charges_spec = None
+
+  return resolve_layer_charges(
+      charges_spec, charge_e=charge_e, charge_h=charge_h
+  )
+
+
+def apply_moire_charges_config(cfg: Any) -> Any:
+  """Synchronizes per-layer carrier charges and layer count aliases on ``cfg``."""
+  if cfg is None or 'system' not in cfg or cfg.system is None:
+    return cfg
+  syscfg = cfg.system
+  mcfg = syscfg.get('moire') if 'moire' in syscfg else None
+  if mcfg is None:
+    return cfg
+
+  # 1. Support n_layer1 / n_layer2 aliases on cfg.system.moire when nspins is
+  # not explicitly set.
+  has_layer_count_aliases = any(
+      mcfg.get(k) is not None
+      for k in (
+          'n_layer1',
+          'n_layer2',
+          'n_layer1_up',
+          'n_layer1_down',
+          'n_layer2_up',
+          'n_layer2_down',
+      )
+  )
+  if has_layer_count_aliases and mcfg.get('nspins') is None:
+    spin_polarized = bool(mcfg.get('spin_polarized', False))
+    n1_total_spec = (
+        mcfg.get('n_layer1')
+        if mcfg.get('n_layer1') is not None
+        else mcfg.get('n_electrons')
+    )
+    if n1_total_spec is not None:
+      n1_total = validate_nonnegative_int(n1_total_spec, 'moire.n_electrons')
+      n1_up = n1_total if spin_polarized else n1_total - (n1_total // 2)
+      n1_down = 0 if spin_polarized else n1_total // 2
+    else:
+      n1_up = validate_nonnegative_int(
+          mcfg.get('n_layer1_up')
+          if mcfg.get('n_layer1_up') is not None
+          else mcfg.get('n_electrons_up', 2),
+          'moire.n_electrons_up',
+      )
+      n1_down = validate_nonnegative_int(
+          mcfg.get('n_layer1_down')
+          if mcfg.get('n_layer1_down') is not None
+          else mcfg.get('n_electrons_down', 2),
+          'moire.n_electrons_down',
+      )
+      if spin_polarized:
+        n1_up, n1_down = n1_up + n1_down, 0
+
+    n2_total_spec = (
+        mcfg.get('n_layer2')
+        if mcfg.get('n_layer2') is not None
+        else mcfg.get('n_holes')
+    )
+    if n2_total_spec is not None:
+      n2_total = validate_nonnegative_int(n2_total_spec, 'moire.n_holes')
+      n2_up = n2_total if spin_polarized else n2_total - (n2_total // 2)
+      n2_down = 0 if spin_polarized else n2_total // 2
+    else:
+      n2_up = validate_nonnegative_int(
+          mcfg.get('n_layer2_up')
+          if mcfg.get('n_layer2_up') is not None
+          else mcfg.get('n_holes_up', 2),
+          'moire.n_holes_up',
+      )
+      n2_down = validate_nonnegative_int(
+          mcfg.get('n_layer2_down')
+          if mcfg.get('n_layer2_down') is not None
+          else mcfg.get('n_holes_down', 2),
+          'moire.n_holes_down',
+      )
+      if spin_polarized:
+        n2_up, n2_down = n2_up + n2_down, 0
+
+    nspins = (n1_up, n1_down, n2_up, n2_down)
+    n_e, n_h = layer_particle_counts(nspins)
+    if n_e < 0 or n_h < 0 or (n_e + n_h) <= 0:
+      raise ValueError(
+          f'Carrier counts must be non-negative with N_e + N_h > 0, got '
+          f'nspins={nspins} (n_electrons={n_e}, n_holes={n_h}).'
+      )
+    with cfg.ignore_type():
+      cfg.system.electrons = nspins
+
+  # 2. Synchronize per-layer carrier charges when specified on cfg.system,
+  # cfg.system.moire, or cfg.system.make_local_energy_kwargs. When unset, leave
+  # cfg completely unchanged for 100% backward compatibility.
+  charge_keys = (
+      'charges',
+      'layer_charges',
+      'carrier_types',
+      'charge_e',
+      'charge_h',
+      'charge_1',
+      'charge_2',
+  )
+  has_sys_or_mcfg_charge_spec = any(
+      mcfg.get(k) is not None for k in charge_keys
+  ) or any(syscfg.get(k) is not None for k in charge_keys)
+  le_kwargs = (
+      dict(cfg.system.make_local_energy_kwargs)
+      if cfg.system.get('make_local_energy_kwargs') is not None
+      else {}
+  )
+  if not has_sys_or_mcfg_charge_spec and 'layer_charges' not in le_kwargs:
+    return cfg
+
+  if has_sys_or_mcfg_charge_spec:
+    charge_e, charge_h = resolve_moire_charges_from_config(mcfg, syscfg=syscfg)
+  else:
+    charge_e, charge_h = resolve_layer_charges(
+        le_kwargs.get('layer_charges'),
+        charge_e=le_kwargs.get('charge_e'),
+        charge_h=le_kwargs.get('charge_h'),
+    )
+  layer_charges = (int(charge_e), int(charge_h))
+  allow_charged_capacitor = bool(mcfg.get('allow_charged_capacitor', False))
+  if mcfg.get('include_capacitor') is None:
+    include_capacitor = bool(charge_e * charge_h < 0)
+  elif charge_e * charge_h > 0 and not allow_charged_capacitor:
+    include_capacitor = False
+  else:
+    include_capacitor = bool(mcfg.include_capacitor)
+
+  with cfg.ignore_type():
+    le_kwargs.update({
+        'include_capacitor': include_capacitor,
+        'allow_charged_capacitor': allow_charged_capacitor,
+        'layer_charges': layer_charges,
+        'charge_e': int(charge_e),
+        'charge_h': int(charge_h),
+    })
+    cfg.system.make_local_energy_kwargs = le_kwargs
+    if 'network' in cfg and cfg.network is not None:
+      jastrow_kwargs = (
+          dict(cfg.network.jastrow_kwargs)
+          if cfg.network.get('jastrow_kwargs') is not None
+          else {}
+      )
+      jastrow_kwargs.update({
+          'charges': layer_charges,
+          'charge_e': int(charge_e),
+          'charge_h': int(charge_h),
+      })
+      cfg.network.jastrow_kwargs = jastrow_kwargs
+  return cfg
 
 def layer_particle_counts(nspins: Sequence[int]) -> Tuple[int, int]:
   """Resolves total (n_electrons, n_holes) from 4- or 2-channel ``nspins``.
