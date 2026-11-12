@@ -47,7 +47,7 @@ class Writer(contextlib.AbstractContextManager):
     self._log = log
 
   def __enter__(self):
-    self._file = open(self._filename, 'w', encoding='UTF-8')
+    self._file = open(self._filename, 'a', encoding='UTF-8') #change to append mode so train.csv isn't wiped out by new runs continuing on a checkpoint
     # write top row of csv
     if self._iteration_key:
       self._file.write(f'{self._iteration_key},')

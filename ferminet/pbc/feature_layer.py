@@ -55,6 +55,7 @@ def make_pbc_feature_layer(
     ndim: int = 3,
     rescale_inputs: bool = False,
     lattice: Optional[jnp.ndarray] = None,
+    primitive_lattice: Optional[jnp.ndarray] = None,
     include_r_ae: bool = True,
     interlayer_distance: float = 0.0,
     distance_scale: float = 1.0,
@@ -69,8 +70,13 @@ def make_pbc_feature_layer(
       ndim: dimension of the system.
       rescale_inputs: If true, rescales r_ae for stability. Note that unlike in
         the OBC case, we do not rescale r_ee as well.
-      lattice: Matrix whose columns are the primitive lattice vectors of the
-        system, shape (ndim, ndim).
+      lattice: Matrix whose columns are the simulation (supercell) lattice
+        vectors of the system, shape (ndim, ndim). Used for two-particle (ee)
+        periodic features.
+      primitive_lattice: Optional matrix whose columns are the primitive unit
+        cell (e.g. moire unit cell) lattice vectors of the system, shape
+        (ndim, ndim). Used for single-particle (ae) periodic features. Defaults
+        to ``lattice`` when None.
       include_r_ae: Flag to enable electron-atom distance features. Set to False
         to avoid cusps with ghost atoms in, e.g., homogeneous electron gas. If
         not needed, set cfg.network.make_feature_layer_kwargs['include_r_ae'] =
@@ -89,17 +95,34 @@ def make_pbc_feature_layer(
 
   if lattice is None:
     lattice = jnp.eye(ndim)
-  
+  else:
+    lattice = jnp.asarray(lattice)
+
+  if primitive_lattice is None:
+    primitive_lattice = lattice
+  else:
+    primitive_lattice = jnp.asarray(primitive_lattice)
+    if primitive_lattice.shape != lattice.shape:
+      raise ValueError(
+          'primitive_lattice must have the same shape as lattice '
+          f'{lattice.shape}, got {primitive_lattice.shape}.'
+      )
+
   distance_scale = float(distance_scale)
   if not math.isfinite(distance_scale) or distance_scale <= 0.0:
     raise ValueError(
         f'distance_scale must be finite and positive, got {distance_scale}.'
     )
 
-  # Calculate reciprocal vectors, factor 2pi omitted
-  reciprocal_vecs = jnp.linalg.inv(lattice)
-  scaled_lattice = lattice / distance_scale
-  lattice_metric = scaled_lattice.T @ scaled_lattice
+  # Calculate reciprocal vectors, factor 2pi omitted:
+  # - ae uses primitive_lattice (primitive / moire unit cell)
+  # - ee uses lattice (simulation supercell)
+  ae_reciprocal_vecs = jnp.linalg.inv(primitive_lattice)
+  ee_reciprocal_vecs = jnp.linalg.inv(lattice)
+  scaled_prim_lattice = primitive_lattice / distance_scale
+  ae_lattice_metric = scaled_prim_lattice.T @ scaled_prim_lattice
+  scaled_sim_lattice = lattice / distance_scale
+  ee_lattice_metric = scaled_sim_lattice.T @ scaled_sim_lattice
   
   # z_sq is just a n_total*n_total matrix that is (d / distance_scale)**2
   # between all pairs of particles that are on different layers, and 0 between
@@ -132,23 +155,23 @@ def make_pbc_feature_layer(
       ae, r_ae, ee, r_ee, **params: jnp.ndarray
   ) -> Tuple[jnp.ndarray, jnp.ndarray]:
     del params
-    # One e features in phase coordinates, (s_ae)_i = k_i . ae
-    s_ae = jnp.einsum('il,jkl->jki', reciprocal_vecs, ae)
-    # Two e features in phase coordinates
-    s_ee = jnp.einsum('il,jkl->jki', reciprocal_vecs, ee)
+    # One-e features in primitive-cell phase coordinates, (s_ae)_i = b_prim_i . ae
+    s_ae = jnp.einsum('il,jkl->jki', ae_reciprocal_vecs, ae)
+    # Two-e features in supercell phase coordinates, (s_ee)_i = b_super_i . ee
+    s_ee = jnp.einsum('il,jkl->jki', ee_reciprocal_vecs, ee)
     # Periodized features
     ae = jnp.concatenate(
         (jnp.sin(2 * jnp.pi * s_ae), jnp.cos(2 * jnp.pi * s_ae)), axis=-1)
     ee = jnp.concatenate(
         (jnp.sin(2 * jnp.pi * s_ee), jnp.cos(2 * jnp.pi * s_ee)), axis=-1)
     # Distance features defined on orthonormal projections
-    r_ae = periodic_norm(lattice_metric, s_ae)
+    r_ae = periodic_norm(ae_lattice_metric, s_ae)
     if rescale_inputs:
       r_ae = jnp.log(1 + r_ae)
     # Don't take gradients through |0|
     n = ee.shape[0]
     # s_ee += jnp.eye(n)[..., None]
-    r_ee_sq = periodic_norm_sq(lattice_metric, s_ee) #Avoided adding 1 to periodic fractional coordinate (which was used in OBC) since shifting s by 1 will make periodic coordinates back to 0
+    r_ee_sq = periodic_norm_sq(ee_lattice_metric, s_ee) #Avoided adding 1 to periodic fractional coordinate (which was used in OBC) since shifting s by 1 will make periodic coordinates back to 0
     eye = jnp.eye(n, dtype=r_ee_sq.dtype)
     
     if z_sq is not None:

@@ -186,10 +186,9 @@ def restore(restore_filename: str, batch_size: Optional[int] = None):
     density_state: optional state of the density matrix calculation
 
   Raises:
-    ValueError: if the leading dimension of data does not match the number of
-    devices (i.e. the number of devices being parallelised over has changed) or
-    if the total batch size is not equal to the number of MCMC configurations in
-    data.
+    ValueError: if the total batch size is not equal to the number of MCMC
+    configurations in data, or if the total number of MCMC configurations is not
+    divisible by the total number of devices.
   """
   logging.info('Loading checkpoint %s', restore_filename)
   with open(restore_filename, 'rb') as f:
@@ -209,23 +208,47 @@ def restore(restore_filename: str, batch_size: Optional[int] = None):
     total_devices = jax.device_count()
     local_devices = jax.local_device_count()
     ckpt_local_devices = int(mcmc_width.shape[0])
+
+    def _re_replicate(x):
+      if isinstance(x, (np.ndarray, jax.Array)):
+        if x.ndim < 1 or x.shape[0] != ckpt_local_devices:
+          raise ValueError(
+              f'Expected replicated leaf leading dimension '
+              f'{ckpt_local_devices}, got shape {x.shape}.'
+          )
+        return jnp.repeat(jnp.asarray(x[:1]), local_devices, axis=0)
+      return x
+
     if ckpt_local_devices != local_devices:
-      raise ValueError(
-          f'Checkpoint was saved with {ckpt_local_devices} local devices per '
-          f'host, but current process has {local_devices} local devices.'
+      logging.info(
+          'Re-replicating checkpoint state from %d to %d local devices.',
+          ckpt_local_devices,
+          local_devices,
       )
+      params = jax.tree_util.tree_map(_re_replicate, params)
+      if opt_state is not None:
+        opt_state = jax.tree_util.tree_map(_re_replicate, opt_state)
+      mcmc_width = _re_replicate(mcmc_width)
+
     total_walkers = data.positions.shape[0] * data.positions.shape[1]
-    if batch_size and total_walkers != batch_size:
+    target_walkers = batch_size or total_walkers
+    if target_walkers > total_walkers:
       raise ValueError(
           f'Wrong batch size in loaded data. Expected {batch_size}, found '
           f'{total_walkers}.')
-  
-    if total_walkers % total_devices != 0:
+    if target_walkers < total_walkers:
+      logging.info(
+          'Subsampling walkers in checkpoint from %d to %d.',
+          total_walkers,
+          target_walkers,
+      )
+
+    if target_walkers % total_devices != 0:
       raise ValueError(
-          f'Total walkers {total_walkers} not divisible by '
+          f'Target walkers {target_walkers} not divisible by '
           f'{total_devices} total devices.'
       )
-    
+
     # Slice the data and distribute it to the local devices on each host
     host_idx = jax.process_index()
     start = host_idx * local_devices
@@ -233,8 +256,9 @@ def restore(restore_filename: str, batch_size: Optional[int] = None):
 
     def _slice_host(x):
       x = np.asarray(x)
-      per_device = (x.shape[0] * x.shape[1]) // total_devices
-      x = x.reshape((total_devices, per_device) + x.shape[2:])
+      x = x.reshape((total_walkers,) + x.shape[2:])[:target_walkers]
+      per_device = target_walkers // total_devices
+      x = x.reshape((total_devices, per_device) + x.shape[1:])
       return x[start:end]
 
     data = networks.FermiNetData(
@@ -244,11 +268,16 @@ def restore(restore_filename: str, batch_size: Optional[int] = None):
         charges=_slice_host(data.charges),
     )
     if density_state is not None:
+      density_move_width = (
+          _re_replicate(density_state.move_width)
+          if ckpt_local_devices != local_devices
+          else density_state.move_width
+      )
       density_state = observables.DensityState(
           t=density_state.t,
           positions=_slice_host(density_state.positions),
           probabilities=_slice_host(density_state.probabilities),
-          move_width=density_state.move_width,
+          move_width=density_move_width,
           pmove=density_state.pmove,
           mo_coeff=density_state.mo_coeff,
       )

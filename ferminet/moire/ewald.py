@@ -212,6 +212,7 @@ class BilayerEwaldSum:
     
     # Interlayer reciprocal weight for half-space G-vectors:
     # Parry 2D Ewald summation formula (https://www.sciencedirect.com/science/article/pii/0039602875903623)
+    # Also in Appendix of this paper: https://iopscience.iop.org/article/10.1088/0953-8984/16/6/017
     # W_d(G) = (pi / (A G)) * [exp(-G^2/(4 alpha^2) - alpha^2 d^2) *
     #          erfcx(G/(2 alpha) + alpha d) + exp(-G d) * erfc(G/(2 alpha) - alpha d)]
     d = self.interlayer_distance

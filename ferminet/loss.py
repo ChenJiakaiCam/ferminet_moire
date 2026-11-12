@@ -15,6 +15,7 @@
 """Helper functions to create the loss and custom gradient of the loss."""
 
 import functools
+import math
 from typing import Any, Tuple
 
 import chex
@@ -150,13 +151,33 @@ def clip_local_values(
   return diff_center, diff
 
 
+def _validate_energy_scale(energy_scale: float) -> float:
+  """Validates that ``energy_scale`` is a finite positive real scalar."""
+  if isinstance(energy_scale, bool):
+    raise ValueError(
+        f'energy_scale must be a positive float, got {energy_scale!r}.'
+    )
+  try:
+    scale = float(energy_scale)
+  except (TypeError, ValueError) as exc:
+    raise ValueError(
+        f'energy_scale must be a positive float, got {energy_scale!r}.'
+    ) from exc
+  if not math.isfinite(scale) or scale <= 0.0:
+    raise ValueError(
+        f'energy_scale must be finite and positive, got {energy_scale}.'
+    )
+  return scale
+
+
 def make_loss(network: networks.LogFermiNetLike,
               local_energy: hamiltonian.LocalEnergy,
               clip_local_energy: float = 0.0,
               clip_from_median: bool = True,
               center_at_clipped_energy: bool = True,
               complex_output: bool = False,
-              max_vmap_batch_size: int = 0) -> LossFn:
+              max_vmap_batch_size: int = 0,
+              energy_scale: float = 1.0) -> LossFn:
   """Creates the loss function, including custom gradients.
 
   Args:
@@ -178,12 +199,18 @@ def make_loss(network: networks.LogFermiNetLike,
     complex_output: If true, the local energies will be complex valued.
     max_vmap_batch_size: If 0, use standard vmap. If >0, use batched_vmap with
       the given batch size.
+    energy_scale: Characteristic energy scale (in Hartree) by which local
+      energies are divided so that the optimization objective and gradients are
+      dimensionless. Defaults to 1.0.
 
   Returns:
     Callable with signature (params, data) and returns (loss, aux_data), where
     loss is the mean energy, and aux_data is an AuxiliaryLossDataobject. The
     loss is averaged over the batch and over all devices inside a pmap.
   """
+  energy_scale = _validate_energy_scale(energy_scale)
+  inv_energy_scale = 1.0 / energy_scale
+
   vmap: Any = jax.vmap if max_vmap_batch_size == 0 else functools.partial(
       folx.batched_vmap, max_batch_size=max_vmap_batch_size)
   batch_local_energy = vmap(
@@ -222,6 +249,11 @@ def make_loss(network: networks.LogFermiNetLike,
     """
     keys = jax.random.split(key, num=data.positions.shape[0])
     e_l, e_l_mat = batch_local_energy(params, keys, data)
+    if energy_scale != 1.0:
+      scale = jnp.asarray(inv_energy_scale, dtype=e_l.real.dtype)
+      e_l = e_l * scale
+      if e_l_mat is not None:
+        e_l_mat = e_l_mat * scale
     loss = constants.pmean(jnp.mean(e_l))
     loss_diff = e_l - loss
     variance = constants.pmean(jnp.mean(loss_diff * jnp.conj(loss_diff)))
@@ -293,7 +325,8 @@ def make_wqmc_loss(
     center_at_clipped_energy: bool = True,
     complex_output: bool = False,
     max_vmap_batch_size: int = 0,
-    vmc_weight: float = 0.0
+    vmc_weight: float = 0.0,
+    energy_scale: float = 1.0,
 ) -> LossFn:
   """Creates the WQMC loss function, including custom gradients.
 
@@ -318,12 +351,18 @@ def make_wqmc_loss(
       the given batch size.
     vmc_weight: The weight of the contribution from the standard VMC energy
       gradient.
+    energy_scale: Characteristic energy scale (in Hartree) by which local
+      energies are divided so that the optimization objective and gradients are
+      dimensionless. Defaults to 1.0.
 
   Returns:
     Callable with signature (params, data) and returns (loss, aux_data), where
     loss is the mean energy, and aux_data is an AuxiliaryLossDataobject. The
     loss is averaged over the batch and over all devices inside a pmap.
   """
+  energy_scale = _validate_energy_scale(energy_scale)
+  inv_energy_scale = 1.0 / energy_scale
+
   vmap: Any = jax.vmap if max_vmap_batch_size == 0 else functools.partial(
       folx.batched_vmap, max_batch_size=max_vmap_batch_size)
   batch_local_energy = vmap(
@@ -362,6 +401,11 @@ def make_wqmc_loss(
     """
     keys = jax.random.split(key, num=data.positions.shape[0])
     e_l, e_l_mat = batch_local_energy(params, keys, data)
+    if energy_scale != 1.0:
+      scale = jnp.asarray(inv_energy_scale, dtype=e_l.real.dtype)
+      e_l = e_l * scale
+      if e_l_mat is not None:
+        e_l_mat = e_l_mat * scale
     loss = constants.pmean(jnp.mean(e_l))
     loss_diff = e_l - loss
     variance = constants.pmean(jnp.mean(loss_diff * jnp.conj(loss_diff)))
@@ -373,7 +417,10 @@ def make_wqmc_loss(
           atoms=data.atoms,
           charges=data.charges,
       )
-      return batch_local_energy(params, keys, network_data)[0].sum()
+      el_sum = batch_local_energy(params, keys, network_data)[0].sum()
+      if energy_scale != 1.0:
+        el_sum = el_sum * jnp.asarray(inv_energy_scale, dtype=el_sum.real.dtype)
+      return el_sum
 
     grad_e_l = jax.grad(batch_local_energy_pos)(data.positions)
     grad_e_l = jnp.tanh(jax.lax.stop_gradient(grad_e_l))
@@ -447,7 +494,8 @@ def make_energy_overlap_loss(network: networks.LogFermiNetLike,
                              overlap_penalty: float = 1.0,
                              overlap_weight: Tuple[float, ...] = (1.0,),
                              complex_output: bool = False,
-                             max_vmap_batch_size: int = 0) -> LossFn:
+                             max_vmap_batch_size: int = 0,
+                             energy_scale: float = 1.0) -> LossFn:
   """Creates the loss function for the penalty method for excited states.
 
   Args:
@@ -477,10 +525,15 @@ def make_energy_overlap_loss(network: networks.LogFermiNetLike,
     complex_output: If true, the network output is complex-valued.
     max_vmap_batch_size: If 0, use standard vmap. If >0, use batched_vmap with
       the given batch size.
+    energy_scale: Characteristic energy scale (in Hartree) by which local
+      energies are divided so that the energy term and gradients are
+      dimensionless. Defaults to 1.0.
 
   Returns:
     LossFn callable which evaluates the total energy of the system.
   """
+  energy_scale = _validate_energy_scale(energy_scale)
+  inv_energy_scale = 1.0 / energy_scale
 
   vmap: Any = jax.vmap if max_vmap_batch_size == 0 else functools.partial(
       folx.batched_vmap, max_batch_size=max_vmap_batch_size)
@@ -502,6 +555,8 @@ def make_energy_overlap_loss(network: networks.LogFermiNetLike,
     # Energy term. Largely similar to make_energy_loss, but simplified.
     keys = jax.random.split(key, num=data.positions.shape[0])
     e_l, _ = batch_local_energy(params, keys, data)
+    if energy_scale != 1.0:
+      e_l = e_l * jnp.asarray(inv_energy_scale, dtype=e_l.real.dtype)
     loss = constants.pmean(jnp.mean(e_l, axis=0))
     loss_diff = e_l - loss
     variance = constants.pmean(
