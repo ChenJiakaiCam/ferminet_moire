@@ -307,6 +307,32 @@ class AnisotropicMoireTest(parameterized.TestCase):
     with self.assertRaises(ValueError):
       geometry.validate_mass_tensor_2d([[0.0, 0.0], [0.0, 0.5]])  # eigval == 0
 
+    # Default config represents electrons-only strained monolayer 1T'-ReSe2.
+    cfg_def = base_config.resolve(anisotropic_moire_bilayer.get_config())
+    self.assertEqual(tuple(cfg_def.system.electrons), (3, 3, 0, 0))
+    le_def = cfg_def.system.make_local_energy_kwargs
+    self.assertAlmostEqual(float(le_def['v_e']), -5.512e-4, places=12)
+    self.assertAlmostEqual(float(le_def['v_h']), 0.0, places=12)
+    self.assertAlmostEqual(
+        float(le_def['dielectric_constant']), 3.0, places=12
+    )
+    self.assertTrue(bool(le_def['allow_charged_capacitor']))
+    self.assertIsNotNone(le_def['moire_gvectors_e'])
+    self.assertIsNone(le_def['moire_gvectors_h'])
+    self.assertIsNone(le_def['mass_tensor_h'])
+    mt_rese2 = np.asarray(le_def['mass_tensor_e'], dtype=np.float64)
+    eigvals, eigvecs = np.linalg.eigh(mt_rese2)
+    np.testing.assert_allclose(eigvals, (0.55, 3.52), rtol=1e-12, atol=1e-12)
+    self.assertAlmostEqual(float(le_def['mass_e']), 2.035, places=12)
+    prim_def = np.asarray(le_def['moire_lattice'], dtype=np.float64)
+    a_short = prim_def[:, int(np.argmin(np.linalg.norm(prim_def, axis=0)))]
+    theta_short = np.arctan2(a_short[1], a_short[0])
+    theta_expect = theta_short + np.deg2rad(-7.4)
+    e_light_expect = np.array([np.cos(theta_expect), np.sin(theta_expect)])
+    self.assertAlmostEqual(
+        abs(float(np.dot(eigvecs[:, 0], e_light_expect))), 1.0, places=12
+    )
+
     # Both v_e and v_h non-zero when anisotropic=True must fail.
     cfg_both = anisotropic_moire_bilayer.get_config()
     cfg_both.system.moire.v_e = -1.0e-4
@@ -316,32 +342,32 @@ class AnisotropicMoireTest(parameterized.TestCase):
 
     # Multi-shell length (e.g. 2 or 4) when anisotropic=True must fail.
     cfg_ms = anisotropic_moire_bilayer.get_config()
-    cfg_ms.system.moire.v_h = (-1.0e-4, -2.0e-5)
+    cfg_ms.system.moire.v_e = (-1.0e-4, -2.0e-5)
     with self.assertRaises(ValueError):
       base_config.resolve(cfg_ms)
 
-    # Mass tensor on electron layer when moire potential is on hole layer fails.
+    # Mass tensor on hole layer when moire potential is on electron layer fails.
     cfg_wrong_layer = anisotropic_moire_bilayer.get_config()
-    cfg_wrong_layer.system.moire.mass_tensor_h = None
-    cfg_wrong_layer.system.moire.mass_tensor_e = ((0.6, 0.0), (0.0, 0.8))
+    cfg_wrong_layer.system.moire.mass_tensor_e = None
+    cfg_wrong_layer.system.moire.mass_tensor_h = ((0.6, 0.0), (0.0, 0.8))
     with self.assertRaises(ValueError):
       base_config.resolve(cfg_wrong_layer)
 
-    # Electron-layer anisotropic configuration (v_e != 0, v_h == 0) succeeds.
-    cfg_e = anisotropic_moire_bilayer.get_config()
-    cfg_e.system.moire.v_e = -3.0e-4
-    cfg_e.system.moire.v_h = 0.0
-    cfg_e.system.moire.mass_tensor_h = None
-    cfg_e.system.moire.mass_tensor = ((0.60, 0.05), (0.05, 0.80))
-    cfg_e = base_config.resolve(cfg_e)
-    le_e = cfg_e.system.make_local_energy_kwargs
-    self.assertIsNotNone(le_e['moire_gvectors_e'])
-    self.assertIsNone(le_e['moire_gvectors_h'])
+    # Hole-layer anisotropic configuration (v_e == 0, v_h != 0) also succeeds.
+    cfg_h = anisotropic_moire_bilayer.get_config()
+    cfg_h.system.moire.v_e = 0.0
+    cfg_h.system.moire.v_h = -3.0e-4
+    cfg_h.system.moire.mass_tensor_e = None
+    cfg_h.system.moire.mass_tensor = ((0.60, 0.05), (0.05, 0.80))
+    cfg_h = base_config.resolve(cfg_h)
+    le_h = cfg_h.system.make_local_energy_kwargs
+    self.assertIsNone(le_h['moire_gvectors_e'])
+    self.assertIsNotNone(le_h['moire_gvectors_h'])
+    self.assertIsNone(le_h['mass_tensor_e'])
     np.testing.assert_allclose(
-        le_e['mass_tensor_e'], ((0.60, 0.05), (0.05, 0.80))
+        le_h['mass_tensor_h'], ((0.60, 0.05), (0.05, 0.80))
     )
-    self.assertIsNone(le_e['mass_tensor_h'])
-    self.assertAlmostEqual(le_e['mass_e'], 0.70, places=12)
+    self.assertAlmostEqual(le_h['mass_h'], 0.70, places=12)
 
   def test_anisotropic_plane_wave_kinetic_energy_analytic(self):
     """Checks -1/2 del_i (M^{-1})_{ij} del_j on an exact plane-wave state."""
@@ -564,8 +590,8 @@ class AnisotropicMoireTest(parameterized.TestCase):
   def test_anisotropic_distance_scale_energy_scale_and_enlarged_unit_cell(self):
     """Tests average lattice period scaling, Tr(M)/2 mass, and idempotency."""
     cfg = anisotropic_moire_bilayer.get_config()
-    cfg.system.moire.mass_e = 0.70
-    cfg.system.moire.mass_tensor_h = ((0.42, 0.08), (0.08, 0.58))
+    cfg.system.moire.mass_tensor_e = ((0.42, 0.08), (0.08, 0.58))
+    cfg.system.moire.mass_h = 0.70
     cfg.network.jastrow = 'bilayer'
     cfg = base_config.resolve(cfg)
 
@@ -575,9 +601,9 @@ class AnisotropicMoireTest(parameterized.TestCase):
     a1 = float(np.linalg.norm(expected_prim[:, 0]))
     a2 = float(np.linalg.norm(expected_prim[:, 1]))
     expected_a_avg = 0.5 * (a1 + a2)
-    expected_mh_eff = 0.5 * (0.42 + 0.58)  # 0.50
+    expected_me_eff = 0.5 * (0.42 + 0.58)  # 0.50
     expected_e_scale = 1.0 / (
-        2.0 * (0.70 + expected_mh_eff) * (expected_a_avg ** 2)
+        2.0 * (expected_me_eff + 0.70) * (expected_a_avg ** 2)
     )
 
     self.assertAlmostEqual(
@@ -589,7 +615,7 @@ class AnisotropicMoireTest(parameterized.TestCase):
         float(cfg.optim.energy_scale), expected_e_scale, places=18
     )
     self.assertAlmostEqual(
-        float(cfg.network.jastrow_kwargs['mass_h']), expected_mh_eff, places=12
+        float(cfg.network.jastrow_kwargs['mass_e']), expected_me_eff, places=12
     )
     np.testing.assert_allclose(cfg.mcmc.pair_lattice, expected_prim)
 
@@ -597,8 +623,8 @@ class AnisotropicMoireTest(parameterized.TestCase):
     cfg_again = geometry.apply_moire_anisotropic_config(copy.deepcopy(cfg))
     np.testing.assert_allclose(cfg_again.system.lattice, cfg.system.lattice)
     np.testing.assert_allclose(
-        cfg_again.system.make_local_energy_kwargs['moire_gvectors_h'],
-        cfg.system.make_local_energy_kwargs['moire_gvectors_h'],
+        cfg_again.system.make_local_energy_kwargs['moire_gvectors_e'],
+        cfg.system.make_local_energy_kwargs['moire_gvectors_e'],
     )
     self.assertAlmostEqual(
         float(cfg_again.network.make_feature_layer_kwargs['distance_scale']),
@@ -608,7 +634,8 @@ class AnisotropicMoireTest(parameterized.TestCase):
 
     # Enlarged 2x1 stripe unit cell preserves 1x1 average moire period scaling.
     cfg_uc = anisotropic_moire_bilayer.get_config()
-    cfg_uc.system.moire.mass_tensor_h = ((0.42, 0.08), (0.08, 0.58))
+    cfg_uc.system.moire.mass_tensor_e = ((0.42, 0.08), (0.08, 0.58))
+    cfg_uc.system.moire.mass_h = 0.70
     cfg_uc.system.unit_cell_matrix = '2x1'
     cfg_uc.system.moire.supercell_matrix = ((2, 0), (0, 2))
     cfg_uc = base_config.resolve(cfg_uc)
@@ -629,14 +656,14 @@ class AnisotropicMoireTest(parameterized.TestCase):
     cfg_fallback = anisotropic_moire_bilayer.get_config()
     cfg_fallback.system.moire.anisotropic = False
     cfg_fallback.system.moire.moire_gvectors = None
-    cfg_fallback.system.moire.mass_tensor_h = None
+    cfg_fallback.system.moire.mass_tensor_e = None
     cfg_fallback = base_config.resolve(cfg_fallback)
     self.assertNotIn(
         'anisotropic', cfg_fallback.system.make_local_energy_kwargs
     )
     self.assertAlmostEqual(
         float(cfg_fallback.network.make_feature_layer_kwargs['distance_scale']),
-        151.18,
+        274.69,
         places=12,
     )
 
@@ -782,12 +809,11 @@ class AnisotropicMoireTest(parameterized.TestCase):
     np.testing.assert_allclose(cfg_custom.mcmc.pair_lattice, custom_pair)
 
   def test_anisotropic_moire_train_step_end_to_end(self):
-    """Runs an end-to-end KFAC VMC step on an anisotropic moire bilayer."""
+    """Runs an end-to-end KFAC VMC step on strained ReSe2 anisotropic moire."""
     with tempfile.TemporaryDirectory() as tmpdir:
       cfg = anisotropic_moire_bilayer.get_config()
-      cfg.system.moire.nspins = (1, 1, 1, 1)
+      cfg.system.moire.nspins = (1, 1, 0, 0)
       cfg.system.moire.supercell_matrix = ((2, 0), (0, 2))
-      cfg.system.moire.mass_tensor_h = ((0.42, 0.07), (0.07, 0.60))
       cfg.system.moire.ewald_gmax = 8
       cfg.network.ferminet.hidden_dims = ((8, 4),)
       cfg.network.determinants = 1

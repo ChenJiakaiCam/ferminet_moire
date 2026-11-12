@@ -1,11 +1,27 @@
-"""Anisotropic 2D electron-hole moire bilayer configuration for FermiNet.
+"""Anisotropic 2D moire superlattice configuration for strained 1T'-ReSe2.
 
-Configures a 2D electron-hole bilayer where the moire potential is active on
-one layer (holes by default) with three generally non-equilateral first-shell
-reciprocal lattice vectors ``(G_1, G_2, G_3)`` satisfying
-``G_1 + G_2 + G_3 = 0`` and an optional 2x2 symmetric positive-definite
-effective mass tensor ``M_{ij}`` (in units of ``m_0``) on that moire-active
-layer so the kinetic operator is ``-1/2 del_i (M^{-1})_{ij} del_j``.
+Configures a 2D moire system where the moire potential is active on one layer
+(electrons by default, modeling uncapped strained monolayer 1T'-ReSe2 on hBN)
+with three generally non-equilateral first-shell reciprocal lattice vectors
+``(G_1, G_2, G_3)`` satisfying ``G_1 + G_2 + G_3 = 0`` and an optional 2x2
+symmetric positive-definite effective mass tensor ``M_{ij}`` (in units of
+``m_0``) on that moire-active layer so the kinetic operator is
+``-1/2 del_i (M^{-1})_{ij} del_j``.
+
+Default physical parameters describe conduction electrons in uncapped strained
+monolayer 1T'-ReSe2 on hBN:
+  * Strained first-shell moire reciprocal triad ``G_1 = (-0.487, 0.204)``,
+    ``G_2 = (0.344, 0.269)``, ``G_3 = (0.143, -0.474)`` ``nm^-1``, giving
+    LLL-reduced primitive moire vectors of lengths ``||A_1|| = 13.64 nm``
+    (``257.73 Bohr``) and ``||A_2|| = 15.43 nm`` (``291.64 Bohr``) with average
+    moire period ``a_M = 14.54 nm`` (``274.69 Bohr``).
+  * Unstrained monolayer 1T'-ReSe2 ab initio DFT conduction-band principal
+    masses ``m_l = 0.55 m_0`` and ``m_h = 3.52 m_0`` (``0.5 * Tr(M) = 2.035
+    m_0``) with a ``-7.4 deg`` offset between the light-mass axis and the
+    ``Re_4`` diamond-chain axis (Z. Xiang et al., arXiv:2605.12761), rotated so
+    the ``Re_4`` chain aligns with the shortest moire primitive vector ``A_1``.
+  * Electrons-only carrier occupancy (``nspins = (3, 3, 0, 0)`` on a ``6 x 3``
+    supercell, ``nu_e = 1/3``) and hBN/vacuum screening ``epsilon_eff = 3.0``.
 
 Both the periodic input distance features (``distance_scale``) and the VMC
 optimization objective (``scale_by_moire_energy = True``) use the average length
@@ -23,6 +39,51 @@ from ferminet.moire import geometry
 from ferminet.utils import system
 import ml_collections
 import numpy as np
+
+
+STRAINED_RESE2_GVECTORS_NM_INV: Tuple[Tuple[float, float], ...] = (
+    (-0.487, 0.204),
+    (0.344, 0.269),
+    (0.143, -0.474),
+)
+# Unstrained monolayer 1T'-ReSe2 conduction-band effective masses (in m_0) and
+# light-mass tilt relative to the Re_4 diamond-chain axis from ab initio DFT
+# (Z. Xiang et al., arXiv:2605.12761).
+RESE2_CONDUCTION_M_LIGHT: float = 0.55
+RESE2_CONDUCTION_M_HEAVY: float = 3.52
+RESE2_CONDUCTION_DFT_OFFSET_DEG: float = -7.4
+
+
+def rese2_conduction_mass_tensor(
+    gvectors: Sequence[Sequence[float]] = STRAINED_RESE2_GVECTORS_NM_INV,
+    gvector_units: str = 'nm^-1',
+    m_light: float = RESE2_CONDUCTION_M_LIGHT,
+    m_heavy: float = RESE2_CONDUCTION_M_HEAVY,
+    dft_offset_deg: float = RESE2_CONDUCTION_DFT_OFFSET_DEG,
+) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+  """Returns the 2x2 ReSe2 conduction mass tensor aligned with shortest A_1.
+
+  Assumes the unstrained 1T'-ReSe2 principal conduction masses ``(m_light,
+  m_heavy)`` are preserved under weak strain while the ``Re_4`` diamond-chain
+  axis aligns with the shortest LLL-reduced moire primitive vector ``A_1``
+  derived from ``gvectors`` (with ``dft_offset_deg`` from the ``Re_4`` chain to
+  the light-mass principal axis).
+  """
+  prim = geometry.primitive_lattice_from_gvectors(
+      gvectors, gvector_units=gvector_units
+  )
+  norms = np.linalg.norm(prim, axis=0)
+  a_short = prim[:, int(np.argmin(norms))]
+  theta_chain = float(np.arctan2(a_short[1], a_short[0]))
+  theta_light = theta_chain + float(np.deg2rad(float(dft_offset_deg)))
+  c, s = float(np.cos(theta_light)), float(np.sin(theta_light))
+  rot = np.array([[c, -s], [s, c]], dtype=np.float64)
+  mat = rot @ np.diag([float(m_light), float(m_heavy)]) @ rot.T
+  mat = 0.5 * (mat + mat.T)
+  return (
+      (float(mat[0, 0]), float(mat[0, 1])),
+      (float(mat[1, 0]), float(mat[1, 1])),
+  )
 
 
 def _format_shell_param(arr: np.ndarray) -> Union[float, Tuple[float, ...]]:
@@ -355,28 +416,35 @@ def get_config() -> ml_collections.ConfigDict:
   cfg.system.moire = ml_collections.ConfigDict(
       {
           'anisotropic': True,
+          # Electrons-only strained 1T'-ReSe2 monolayer (nu_e = 1/3 on 6 x 3).
           'n_electrons_up': 3,
           'n_electrons_down': 3,
-          'n_holes_up': 3,
-          'n_holes_down': 3,
+          'n_holes_up': 0,
+          'n_holes_down': 0,
           'supercell_matrix': ((6, 0), (0, 3)),
           'nspins': None,
           'n_electrons': None,
           'n_holes': None,
           'spin_polarized': False,
-          # Isotropic scalar masses (used on the layer without mass_tensor_*).
-          'mass_e': 0.70,
+          # Isotropic scalar masses (used on any layer without mass_tensor_*;
+          # mass_e defaults to 0.5 * Tr(M_e) = 2.035 m_0 for 1T'-ReSe2).
+          'mass_e': 0.5 * (RESE2_CONDUCTION_M_LIGHT + RESE2_CONDUCTION_M_HEAVY),
           'mass_h': 0.45,
           # Optional 2x2 symmetric positive-definite effective mass tensor M_ij
           # (in units of m_0) on the moire-active layer so kinetic energy is
           # -1/2 del_i (M^{-1})_{ij} del_j. Off-diagonal entries are supported.
+          # Defaults to unstrained 1T'-ReSe2 conduction-band DFT masses
+          # (m_l = 0.55, m_h = 3.52, -7.4 deg offset from Re_4 chain; Xiang et
+          # al., arXiv:2605.12761) with the Re_4 chain aligned along the
+          # shortest moire primitive vector A_1.
           'mass_tensor': None,
-          'mass_tensor_e': None,
-          'mass_tensor_h': ((0.40, 0.0), (0.0, 0.55)),
+          'mass_tensor_e': rese2_conduction_mass_tensor(),
+          'mass_tensor_h': None,
           'interlayer_distance': 37.79,
-          # Fallback lattice_constant (used only when anisotropic=False and
-          # primitive_lattice is None).
-          'lattice_constant': 151.18,
+          # Average moire period 0.5 * (||A_1|| + ||A_2||) = 274.69 Bohr
+          # (14.54 nm) of STRAINED_RESE2_GVECTORS_NM_INV; used as fallback when
+          # anisotropic=False and primitive_lattice is None.
+          'lattice_constant': 274.69,
           'primitive_lattice': None,
           'supercell_lattice': None,
           'moire_lattice_e': None,
@@ -384,11 +452,7 @@ def get_config() -> ml_collections.ConfigDict:
           # First-shell anisotropic reciprocal lattice triad (G_1, G_2, G_3)
           # satisfying G_1 + G_2 + G_3 = 0 (3-decimal rounded inputs are closed
           # via G_3 <- -(G_1 + G_2)). Units: 'bohr^-1', 'nm^-1', 'angstrom^-1'.
-          'moire_gvectors': (
-              (-0.487, 0.204),
-              (0.344, 0.269),
-              (0.143, -0.474),
-          ),
+          'moire_gvectors': STRAINED_RESE2_GVECTORS_NM_INV,
           'moire_gvectors_e': None,
           'moire_gvectors_h': None,
           'gvector_units': 'nm^-1',
@@ -396,21 +460,22 @@ def get_config() -> ml_collections.ConfigDict:
           #   V_alpha(r) = 2 * sum_{m=1}^3 v_{alpha,m}
           #                * cos(G_m . (r - offset_alpha) + phi_{alpha,m})
           # Note: V(r) = -(v_q / 4) sum_{m=1}^3 cos(G_m . r) corresponds to
-          # scalar v = -v_q / 8 and phi = 0.0. Both scalar v_h / phi_h and
+          # scalar v = -v_q / 8 and phi = 0.0. Both scalar v_e / phi_e and
           # per-harmonic 3-tuples (v_1, v_2, v_3) / (phi_1, phi_2, phi_3) are
           # supported when anisotropic=True.
-          'v_e': 0.0,
-          'v_h': -5.512e-4,
+          'v_e': -5.512e-4,
+          'v_h': 0.0,
           'phi_e': 0.0,
           'phi_h': 0.0,
           'offset_e': (0.0, 0.0),
           'offset_h': (0.0, 0.0),
-          'dielectric_constant': 5.7,
+          # Uncapped monolayer ReSe2 on hBN: eps_eff = (eps_hBN + 1) / 2 ~ 3.0.
+          'dielectric_constant': 3.0,
           'ewald_gmax': 100,
           'nlatvec': 1,
           'ewald_alpha': None,
           'include_capacitor': True,
-          'allow_charged_capacitor': False,
+          'allow_charged_capacitor': True,
       },
       type_safe=False,
   )
