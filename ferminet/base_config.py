@@ -174,6 +174,11 @@ def default() -> ml_collections.ConfigDict:
           # L_unit (True, matching arXiv:2406.11134 Table S4) or tiles the 1x1
           # primitive moire cell L_prim (False).
           'supercell_in_unit_cells': True,
+          # If true, enables single-layer anisotropic moire potential (three
+          # non-equilateral first-shell reciprocal vectors G_1, G_2, G_3) and a
+          # 2x2 symmetric positive-definite effective mass tensor on the active
+          # moire layer. Defaults to False for 100% backward compatibility.
+          'anisotropic': False,
           # number of spin up, spin-down electrons
           'electrons': tuple(),
           # Dimensionality.
@@ -391,6 +396,8 @@ def resolve(cfg):
   Raises:
     RuntimeError: If an atomic position is non-numeric.
   """
+  from ferminet.moire import geometry as moire_geometry  # pylint: disable=g-import-not-at-top
+  cfg = moire_geometry.prepare_moire_anisotropic_config(cfg)
   if 'set_molecule' in cfg.system and callable(cfg.system.set_molecule):
     cfg = cfg.system.set_molecule(cfg)
     with cfg.ignore_type():  # pyrefly: ignore[missing-attribute]
@@ -398,7 +405,7 @@ def resolve(cfg):
       # This makes the ConfigDict object serialisable.
       if callable(cfg.system.set_molecule):  # pyrefly: ignore[missing-attribute]
         cfg.system.set_molecule = cfg.system.set_molecule.__name__  # pyrefly: ignore[missing-attribute]
-  from ferminet.moire import geometry as moire_geometry  # pylint: disable=g-import-not-at-top
+  cfg = moire_geometry.apply_moire_anisotropic_config(cfg)
   cfg = moire_geometry.apply_moire_unit_cell_config(cfg)
   cfg = moire_geometry.apply_moire_energy_scale_config(cfg)
   cfg = cfg.copy_and_resolve_references()
