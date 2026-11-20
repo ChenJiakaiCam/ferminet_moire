@@ -473,6 +473,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         system.pyscf_mol_to_internal_representation(cfg.system.pyscf_mol))
 
   from ferminet.moire import geometry as moire_geometry  # pylint: disable=g-import-not-at-top
+  cfg = moire_geometry.apply_moire_charges_config(cfg)
   cfg = moire_geometry.apply_moire_unit_cell_config(cfg)
 
   # Convert mol config into array of atomic positions and charges
@@ -729,6 +730,15 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
 
   # Set up logging and observables
   pair_prob = float(cfg.mcmc.get('pair_prob', 0.0))
+  le_layer_charges = (
+      cfg.system.make_local_energy_kwargs.get('layer_charges')
+      if cfg.system.get('make_local_energy_kwargs') is not None
+      else None
+  )
+  if le_layer_charges is not None:
+    q1_mcmc, q2_mcmc = moire_geometry.resolve_layer_charges(le_layer_charges)
+    if q1_mcmc * q2_mcmc > 0:
+      pair_prob = 0.0
   pair_width_scale = float(cfg.mcmc.get('pair_width_scale', 1.0))
   pair_min_fraction = float(cfg.mcmc.get('pair_min_fraction', 2.0 / 3.0))
   n_e_mcmc, n_h_mcmc = mcmc._resolve_layer_counts(nspins, None)
@@ -836,7 +846,6 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
 
   # Construct MCMC step
   atoms_to_mcmc = atoms if cfg.mcmc.scale_by_nuclear_distance else None
-  pair_prob = float(cfg.mcmc.get('pair_prob', 0.0))
   pair_radius = float(cfg.mcmc.get('pair_radius', 0.0))
   pair_lattice = cfg.mcmc.get('pair_lattice', None)
   moire_cfg = cfg.system.get('moire')
