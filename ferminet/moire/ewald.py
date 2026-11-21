@@ -52,6 +52,53 @@ def _halfspace_gpoint_indices_2d(ewald_gmax: int) -> np.ndarray:
   return np.concatenate([block0, block1], axis=0)
 
 
+def _parry_separated_gweight(
+    gnorm_np: np.ndarray,
+    area: float,
+    alpha: float,
+    separation: float,
+) -> np.ndarray:
+  """Parry 2D Ewald half-space reciprocal weight ``W_D(G)`` for z-separation ``D >= 0``."""
+  if separation == 0.0:
+    return (
+        2.0
+        * np.pi
+        * scipy_special.erfc(gnorm_np / (2.0 * alpha))
+        / (area * gnorm_np)
+    )
+  u_plus = gnorm_np / (2.0 * alpha) + alpha * separation
+  u_minus = gnorm_np / (2.0 * alpha) - alpha * separation
+  term_plus = np.exp(
+      -(gnorm_np**2) / (4.0 * alpha**2) - (alpha * separation) ** 2
+  ) * scipy_special.erfcx(u_plus)
+  term_minus = np.exp(-gnorm_np * separation) * scipy_special.erfc(u_minus)
+  return np.pi * (term_plus + term_minus) / (area * gnorm_np)
+
+
+def _parry_same_sign_g0_factor(
+    area: float,
+    alpha: float,
+    separation: float,
+    include_capacitor: bool,
+) -> float:
+  """Parry 2D Ewald ``G = 0`` factor for repulsive ``+1 / sqrt(r^2 + D^2)``."""
+  pref = -2.0 * np.sqrt(np.pi) / area
+  if include_capacitor:
+    return float(
+        pref
+        * (
+            np.exp(-((alpha * separation) ** 2)) / alpha
+            + np.sqrt(np.pi) * separation * scipy_special.erf(alpha * separation)
+        )
+    )
+  return float(
+      pref
+      * (
+          np.exp(-((alpha * separation) ** 2)) / alpha
+          - np.sqrt(np.pi) * separation * scipy_special.erfc(alpha * separation)
+      )
+  )
+
 
 class BilayerEwaldSum:
   r"""2D-periodic Ewald summation for a 2D carrier bilayer.
@@ -93,6 +140,7 @@ class BilayerEwaldSum:
       ] = None,
       charge_e: Optional[geometry.CarrierSpec] = None,
       charge_h: Optional[geometry.CarrierSpec] = None,
+      gate_distance: Optional[float] = None,
   ):
     """Initializes precomputed lattice and reciprocal-space Ewald tables.
 
@@ -118,19 +166,16 @@ class BilayerEwaldSum:
       # The two arguments below basically only decides the reference energy level of the output, they don't change the simulation result.
       # Essentially only changes the output energy values by a constant amount.
         
-      include_capacitor: If True (default for opposite-charge bilayers), include
-        the physical ``G = 0`` parallel-plate capacitor contribution
-        ``-(q_1 * q_2) * (2 * pi * d / (epsilon_r * A)) * N_1 * N_2`` for
-        separated layers. If False (default for same-charge bilayers), subtract
-        this constant capacitor shift (corresponding to per-layer neutralizing
-        backgrounds).
+      include_capacitor: If True (default for ungated opposite-charge bilayers),
+        include the ``G = 0`` parallel-plate capacitor contribution. If False
+        (default for same-charge bilayers and gated systems), subtract the
+        uniform-sheet capacitor shift so per-particle energies match the
+        neutralizing-background convention as ``gate_distance -> inf``.
         
       allow_charged_capacitor: If False (default), raises ``ValueError`` when
-        the total mobile charge ``q_1 * N_1 + q_2 * N_2 != 0``,
-        ``interlayer_distance > 0``, and ``include_capacitor=True``, since a
-        net-charged periodic bilayer has an ambiguous ``G = 0`` electrostatic
-        energy unless the neutralizing background convention is explicitly
-        chosen.
+        an ungated periodic bilayer (``gate_distance is None``) has net mobile
+        charge ``q_1 * N_1 + q_2 * N_2 != 0``, ``interlayer_distance > 0``, and
+        ``include_capacitor=True``.
       charges: Optional 2-tuple ``(q_1, q_2)`` (or 4-tuple or string shorthand
         ``'eh'``, ``'ee'``, ``'he'``, ``'hh'``) specifying the carrier charge in
         each layer (``-1`` for electrons, ``+1`` for holes). Defaults to
@@ -138,6 +183,14 @@ class BilayerEwaldSum:
       layer_charges: Optional alias for ``charges``.
       charge_e: Optional carrier charge/type for layer 1 (defaults to ``-1``).
       charge_h: Optional carrier charge/type for layer 2 (defaults to ``+1``).
+      gate_distance: Optional out-of-plane distance ``d_gate > 0`` in Bohr from
+        layer 1 (``z = 0``) to a grounded metallic gate plane at
+        ``z = -d_gate`` (with layer 2 at ``z = interlayer_distance >= 0``).
+        When ``None`` (default), evaluates standard unscreened 2D Ewald sums.
+        When provided, subtracts exact method-of-images Parry 2D Ewald sums at
+        vertical image separations ``D_11 = 2 * d_gate``,
+        ``D_22 = 2 * (d_gate + d)``, and ``D_12 = 2 * d_gate + d`` (including
+        the single-particle self-image terms ``-N_alpha / (2 * eps_r * D_aa)``).
         
     """
     
@@ -166,12 +219,21 @@ class BilayerEwaldSum:
       )
     if nlatvec < 0:
       raise ValueError(f'nlatvec must be >= 0, got {nlatvec}.')
+    if gate_distance is not None:
+      self.gate_distance: Optional[float] = geometry._validate_positive_float(
+          gate_distance, 'gate_distance'
+      )
+    else:
+      self.gate_distance = None
   
     self.latvec_np = geometry.validate_lattice_2d(lattice) # Note this is the supercell lattice, not the moire unit cell lattice
     self.interlayer_distance = float(interlayer_distance)
     self.dielectric_constant = float(dielectric_constant)
     if include_capacitor is None:
-      self.include_capacitor = bool(self.interlayer_charge_sign < 0.0)
+      if self.gate_distance is not None:
+        self.include_capacitor = False
+      else:
+        self.include_capacitor = bool(self.interlayer_charge_sign < 0.0)
     else:
       self.include_capacitor = bool(include_capacitor)
     self.allow_charged_capacitor = bool(allow_charged_capacitor)
@@ -180,7 +242,8 @@ class BilayerEwaldSum:
         self.charge_e * self.n_electrons + self.charge_h * self.n_holes
     )
     if (
-        net_charge != 0
+        self.gate_distance is None
+        and net_charge != 0
         and self.interlayer_distance > 0.0
         and self.include_capacitor
         and not self.allow_charged_capacitor
@@ -236,12 +299,7 @@ class BilayerEwaldSum:
     
     # Calculating weight for k-space Ewald sum for each k
     # Later for each k it's sum of this weight times sum_j(exp(iGrj))
-    w0_np = ( # Intralayer weight! 0 refers to interlayer separation
-        2.0
-        * np.pi
-        * scipy_special.erfc(gnorm_np / (2.0 * self.alpha))
-        / (self.area * gnorm_np)
-    )
+    w0_np = _parry_separated_gweight(gnorm_np, self.area, self.alpha, 0.0)
     keep = w0_np > _GWEIGHT_TOL
     gpoints_kept = gpoints_np[keep]
     gnorm_kept = gnorm_np[keep]
@@ -256,46 +314,85 @@ class BilayerEwaldSum:
     # W_d(G) = (pi / (A G)) * [exp(-G^2/(4 alpha^2) - alpha^2 d^2) *
     #          erfcx(G/(2 alpha) + alpha d) + exp(-G d) * erfc(G/(2 alpha) - alpha d)]
     d = self.interlayer_distance
-    if d == 0.0:
-      self.gweight_interlayer = self.gweight_coplanar
-    else:
-      u_plus = gnorm_kept / (2.0 * self.alpha) + self.alpha * d
-      u_minus = gnorm_kept / (2.0 * self.alpha) - self.alpha * d
-      term_plus = np.exp(
-          -(gnorm_kept**2) / (4.0 * self.alpha**2) - (self.alpha * d) ** 2
-      ) * scipy_special.erfcx(u_plus)
-      term_minus = np.exp(-gnorm_kept * d) * scipy_special.erfc(u_minus)
-      wd_kept = np.pi * (term_plus + term_minus) / (self.area * gnorm_kept)
-      self.gweight_interlayer = jnp.asarray(wd_kept)
+    wd_kept = (
+        w0_kept
+        if d == 0.0
+        else _parry_separated_gweight(gnorm_kept, self.area, self.alpha, d)
+    )
       
     # Self-interaction and G=0 constants.
     self.self_const_factor = -self.alpha / np.sqrt(np.pi) # The reciprocal Ewald sum includes each particle interacting with its own smooth Ewald charge distribution, which must be removed. lim(R->0)(erf(allpha R )/R) = 2*alpha/sqrt(pi). Then for the entire system it's (-alpha/sqrt(pi))*(N_e+N_h)/epsilon_r
     # G=0 has to be calculated separately with different formula from G!=0, so this is counterpart of self.gweight_coplanar 
     # Basically taking finite part of the gweight formula for G=0
     self.g0_coplanar_factor = -2.0 * np.sqrt(np.pi) / (self.area * self.alpha) 
-    # Again taking finite part of G=0 interalyer weight formula
     s12 = self.interlayer_charge_sign
-    if self.include_capacitor:
+
+    if self.gate_distance is None:
+      self.image_sep_ee: Optional[float] = None
+      self.image_sep_hh: Optional[float] = None
+      self.image_sep_eh: Optional[float] = None
+      self.gweight_coplanar_e = self.gweight_coplanar
+      self.gweight_coplanar_h = self.gweight_coplanar
+      self.gweight_interlayer = jnp.asarray(wd_kept)
+      self.g0_coplanar_e_factor = self.g0_coplanar_factor
+      self.g0_coplanar_h_factor = self.g0_coplanar_factor
       self.g0_interlayer_factor = float(
-          -s12
-          * (2.0 * np.sqrt(np.pi) / self.area)
-          * (
-              np.exp(-((self.alpha * d) ** 2)) / self.alpha
-              + np.sqrt(np.pi) * d * scipy_special.erf(self.alpha * d)
+          s12
+          * _parry_same_sign_g0_factor(
+              self.area, self.alpha, d, self.include_capacitor
           )
       )
     else:
-      # Difference is just the electrostatic energy of two uniformly charged sheets
+      d_g = self.gate_distance
+      d_ee = 2.0 * d_g
+      d_hh = 2.0 * (d_g + d)
+      d_eh = 2.0 * d_g + d
+      self.image_sep_ee = d_ee
+      self.image_sep_hh = d_hh
+      self.image_sep_eh = d_eh
+      w_ee_img = _parry_separated_gweight(
+          gnorm_kept, self.area, self.alpha, d_ee
+      )
+      w_hh_img = _parry_separated_gweight(
+          gnorm_kept, self.area, self.alpha, d_hh
+      )
+      w_eh_img = _parry_separated_gweight(
+          gnorm_kept, self.area, self.alpha, d_eh
+      )
+      self.gweight_coplanar_e = jnp.asarray(w0_kept - w_ee_img)
+      self.gweight_coplanar_h = jnp.asarray(w0_kept - w_hh_img)
+      self.gweight_interlayer = jnp.asarray(wd_kept - w_eh_img)
+      self.g0_coplanar_e_factor = float(
+          self.g0_coplanar_factor
+          - _parry_same_sign_g0_factor(
+              self.area, self.alpha, d_ee, self.include_capacitor
+          )
+      )
+      self.g0_coplanar_h_factor = float(
+          self.g0_coplanar_factor
+          - _parry_same_sign_g0_factor(
+              self.area, self.alpha, d_hh, self.include_capacitor
+          )
+      )
       self.g0_interlayer_factor = float(
-          -s12
-          * (2.0 * np.sqrt(np.pi) / self.area)
+          s12
           * (
-              np.exp(-((self.alpha * d) ** 2)) / self.alpha
-              - np.sqrt(np.pi) * d * scipy_special.erfc(self.alpha * d)
+              _parry_same_sign_g0_factor(
+                  self.area, self.alpha, d, self.include_capacitor
+              )
+              - _parry_same_sign_g0_factor(
+                  self.area, self.alpha, d_eh, self.include_capacitor
+              )
           )
       )
       
-  def _coplanar_energy(self, coords: jnp.ndarray) -> jnp.ndarray:
+  def _coplanar_energy(
+      self,
+      coords: jnp.ndarray,
+      gweight_layer: Optional[jnp.ndarray] = None,
+      g0_layer_factor: Optional[float] = None,
+      image_sep: Optional[float] = None,
+  ) -> jnp.ndarray:
     """
     Computes unscreened periodic energy for one coplanar species.
     U = U_real + U_k + U_self + U_G0
@@ -311,14 +408,18 @@ class BilayerEwaldSum:
     dtype = coords.dtype
     lat_disp = self.lattice_displacements.astype(dtype)
     gpoints = self.gpoints.astype(dtype)
-    gweight = self.gweight_coplanar.astype(dtype)
+    gweight = (
+        self.gweight_coplanar if gweight_layer is None else gweight_layer
+    ).astype(dtype)
+    g0_fac = (
+        self.g0_coplanar_factor if g0_layer_factor is None else g0_layer_factor
+    )
     
     # Closest distance between a particle and a periodic image of another particle, shape (N, N, 2)
     displacements, _ = self.dist_fn(coords, coords) 
     # Displacement vectors from a particle to another particle's set of periodic images, starting from the shortest vector, shape (n_images, N, N, 2)
     rvec = displacements[None, ...] + lat_disp[:, None, None, :]
-    # r = jnp.linalg.norm(rvec, axis=-1) # Shape (n_images, N, N, 2)
-    r_sq = jnp.sum(rvec**2, axis=-1) # Shape (n_images, N, N, 2) #Avoided using lingalg.norm which evaluate sqrt(r^2) before mask, which can cause reverse AD NaNs
+    r_sq = jnp.sum(rvec**2, axis=-1) # Shape (n_images, N, N)
     
     n_imgs = lat_disp.shape[0]
     # Mask gives interactions between pairs of particles (including periodic images) to be included
@@ -326,25 +427,26 @@ class BilayerEwaldSum:
     # Exclude interactions between a particle and itself. Other diagonals not set to 0 represents a particle's interactions with its own periodic images.
     mask = mask.at[self.center_image_idx].set(1.0 - jnp.eye(n_parts, dtype=dtype))
 
-    # Same values as in r, but where r = 0 (mask = 0) we replace 0 with 1 (dummy) because later we need division by r. Doesn't matter because later multiplying by mask removes this entry. 
-    # Also numerically cap the lowest distance between two particles, doens't matter because it's far below physical length scale. 
-    # r_safe = jnp.where(mask < 0.5, 1.0, jnp.maximum(r, 1e-12))
     r_sq_safe = jnp.where(mask < 0.5, 1.0, jnp.maximum(r_sq, 1e-24))
     r_safe = jnp.sqrt(r_sq_safe)
     
     pot_term = jax.lax.erfc(self.alpha * r_safe) / r_safe
     v_real = 0.5 * jnp.sum(pot_term * mask)
+    if image_sep is not None:
+      d_img_sq = jnp.asarray(image_sep**2, dtype=dtype)
+      r_img_safe = jnp.sqrt(jnp.maximum(r_sq + d_img_sq, 1e-24))
+      v_real = v_real - 0.5 * jnp.sum(
+          jax.lax.erfc(self.alpha * r_img_safe) / r_img_safe
+      )
     
-    # V_recip = sum over half-space g points of w_0(G)*|S(G)|^2 where S(G) = sum_j (exp(iGr_j))
+    # V_recip = sum over half-space g points of w_eff(G)*|S(G)|^2 where S(G) = sum_j (exp(iGr_j))
     phases = gpoints @ coords.T #phases[g,j] = G_g * r_j, shape (n_gvectors, n_parts)
     sf_real = jnp.sum(jnp.cos(phases), axis=-1)
     sf_imag = jnp.sum(jnp.sin(phases), axis=-1)
     v_recip = jnp.dot(gweight, sf_real**2 + sf_imag**2)
     
     v_self = jnp.asarray(self.self_const_factor, dtype=dtype) * n_parts
-    v_g0 = 0.5 * jnp.asarray(self.g0_coplanar_factor, dtype=dtype) * (
-        n_parts**2
-    )
+    v_g0 = 0.5 * jnp.asarray(g0_fac, dtype=dtype) * (n_parts**2)
     
     return v_real + v_recip + v_self + v_g0
   
@@ -370,11 +472,16 @@ class BilayerEwaldSum:
     
     displacements, _ = self.dist_fn(pos_e, pos_h)  # Minimum-image distances, shape (n_e, n_h, 2)
     rvec = displacements[None, ...] + lat_disp[:, None, None, :]
-    # r_3d = jnp.sqrt(jnp.sum(rvec**2, axis=-1) + d_sq) #jnp.sum is just summing delta_x^2 + delta_y^2
-    # r_safe = jnp.maximum(r_3d, 1e-12)
-    r_3d_sq = jnp.sum(rvec**2, axis=-1) + d_sq #jnp.sum is just summing delta_x^2 + delta_y^2
+    inplane_sq = jnp.sum(rvec**2, axis=-1)
+    r_3d_sq = inplane_sq + d_sq
     r_safe = jnp.sqrt(jnp.maximum(r_3d_sq, 1e-24))
     v_real = s12 * jnp.sum(jax.lax.erfc(self.alpha * r_safe) / r_safe)
+    if self.image_sep_eh is not None:
+      d_img_sq = jnp.asarray(self.image_sep_eh**2, dtype=dtype)
+      r_img_safe = jnp.sqrt(jnp.maximum(inplane_sq + d_img_sq, 1e-24))
+      v_real = v_real - s12 * jnp.sum(
+          jax.lax.erfc(self.alpha * r_img_safe) / r_img_safe
+      )
 
     #U_recip = 2*s12*Sum over half-space g points of (W_d(G)* Re[S_e(G)S_h(G)*])
     phases_e = gpoints @ pos_e.T
@@ -403,8 +510,18 @@ class BilayerEwaldSum:
       Tuple ``(u_ee, u_hh, u_eh)`` of scalar JAX arrays.
     """
     inv_eps = 1.0 / self.dielectric_constant
-    u_ee = inv_eps * self._coplanar_energy(pos_e)
-    u_hh = inv_eps * self._coplanar_energy(pos_h)
+    u_ee = inv_eps * self._coplanar_energy(
+        pos_e,
+        gweight_layer=self.gweight_coplanar_e,
+        g0_layer_factor=self.g0_coplanar_e_factor,
+        image_sep=self.image_sep_ee,
+    )
+    u_hh = inv_eps * self._coplanar_energy(
+        pos_h,
+        gweight_layer=self.gweight_coplanar_h,
+        g0_layer_factor=self.g0_coplanar_h_factor,
+        image_sep=self.image_sep_hh,
+    )
     u_eh = inv_eps * self._interlayer_energy(pos_e, pos_h)
     return u_ee, u_hh, u_eh
   
@@ -432,6 +549,7 @@ def make_bilayer_ewald_potential(
     layer_charges: Optional[Union[Sequence[geometry.CarrierSpec], str]] = None,
     charge_e: Optional[geometry.CarrierSpec] = None,
     charge_h: Optional[geometry.CarrierSpec] = None,
+    gate_distance: Optional[float] = None,
 ) -> Callable[[jnp.ndarray], jnp.ndarray]:
   """Creates a callable evaluating the 2D-periodic bilayer Coulomb energy.
 
@@ -451,6 +569,8 @@ def make_bilayer_ewald_potential(
     layer_charges: Optional alias for ``charges``.
     charge_e: Optional carrier charge/type for layer 1 (defaults to ``-1``).
     charge_h: Optional carrier charge/type for layer 2 (defaults to ``+1``).
+    gate_distance: Optional out-of-plane distance ``d_gate > 0`` in Bohr from
+      layer 1 to a grounded metallic back gate at ``z = -d_gate``.
 
   Returns:
     Callable ``potential_fn(positions) -> scalar`` returning ``U_ee + U_hh + U_eh``.
@@ -469,6 +589,7 @@ def make_bilayer_ewald_potential(
       layer_charges=layer_charges,
       charge_e=charge_e,
       charge_h=charge_h,
+      gate_distance=gate_distance,
   )
   return ewald.energy
     

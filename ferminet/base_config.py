@@ -174,6 +174,10 @@ def default() -> ml_collections.ConfigDict:
           # L_unit (True, matching arXiv:2406.11134 Table S4) or tiles the 1x1
           # primitive moire cell L_prim (False).
           'supercell_in_unit_cells': True,
+          # If true, enables anisotropic moire reciprocal vectors, multi-harmonic
+          # 2D Fourier moire potentials, and 2x2 SPD effective mass tensors.
+          # Defaults to False for 100% backward compatibility.
+          'anisotropic': False,
           # Optional per-layer carrier charges / types for 2D moire bilayer
           # systems (e.g. (-1, 1) / 'eh' for electron-hole bilayers or
           # (-1, -1) / 'ee' for electron-electron bilayers). When None,
@@ -274,6 +278,10 @@ def default() -> ml_collections.ConfigDict:
           # into mutual nearest-neighbor pairs required before enabling joint
           # electron-hole pair MCMC sweeps.
           'pair_min_fraction': 2.0 / 3.0,
+          # Probability in [0, 1] of proposing a symmetric intra-layer spin
+          # coordinate exchange (r_{i,up} <-> r_{j,down}) at the end of each
+          # MCMC sweep (0.0 disables spin swaps for full backward compatibility).
+          'spin_swap_prob': 0.0,
       },
       'network': {
           'network_type': 'ferminet',  # One of 'ferminet' or 'psiformer'.
@@ -401,6 +409,7 @@ def resolve(cfg):
   """
   from ferminet.moire import geometry as moire_geometry  # pylint: disable=g-import-not-at-top
   cfg = moire_geometry.sync_moire_layer_count_aliases(cfg)
+  cfg = moire_geometry.prepare_moire_anisotropic_config(cfg)
   if 'set_molecule' in cfg.system and callable(cfg.system.set_molecule):
     cfg = cfg.system.set_molecule(cfg)
     with cfg.ignore_type():  # pyrefly: ignore[missing-attribute]
@@ -408,7 +417,9 @@ def resolve(cfg):
       # This makes the ConfigDict object serialisable.
       if callable(cfg.system.set_molecule):  # pyrefly: ignore[missing-attribute]
         cfg.system.set_molecule = cfg.system.set_molecule.__name__  # pyrefly: ignore[missing-attribute]
+  cfg = moire_geometry.apply_moire_anisotropic_config(cfg)
   cfg = moire_geometry.apply_moire_charges_config(cfg)
+  cfg = moire_geometry.apply_moire_gate_config(cfg)
   cfg = moire_geometry.apply_moire_unit_cell_config(cfg)
   cfg = moire_geometry.apply_moire_energy_scale_config(cfg)
   cfg = cfg.copy_and_resolve_references()

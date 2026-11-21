@@ -1131,6 +1131,87 @@ def mh_pair_update(
   return out[:4]
 
 
+def _resolve_spin_swap_ranges(
+    nspins: Sequence[int] | None,
+    layer_counts: tuple[int, int] | None,
+) -> tuple[tuple[int, int, int, int], ...]:
+  """Returns ``(up_start, up_end, dn_start, dn_end)`` per spinful layer."""
+  if nspins is None:
+    return ()
+  counts = [int(n) for n in nspins]
+  if any(n < 0 for n in counts):
+    raise ValueError(f'All entries in nspins must be >= 0, got {nspins}.')
+  if len(counts) == 4:
+    ranges: list[tuple[int, int, int, int]] = []
+    n1_up, n1_dn, n2_up, n2_dn = counts
+    if n1_up > 0 and n1_dn > 0:
+      ranges.append((0, n1_up, n1_up, n1_up + n1_dn))
+    if n2_up > 0 and n2_dn > 0:
+      n_e = n1_up + n1_dn
+      ranges.append((n_e, n_e + n2_up, n_e + n2_up, n_e + n2_up + n2_dn))
+    return tuple(ranges)
+  if len(counts) == 2 and layer_counts is None:
+    n_up, n_dn = counts
+    if n_up > 0 and n_dn > 0:
+      return ((0, n_up, n_up, n_up + n_dn),)
+  return ()
+
+
+def _mh_spin_swap_update(
+    params: networks.ParamTree,
+    f: networks.LogFermiNetLike,
+    data: networks.FermiNetData,
+    key: chex.PRNGKey,
+    lp_1: jnp.ndarray,
+    swap_ranges: tuple[tuple[int, int, int, int], ...],
+    total_particles: int,
+    ndim: int,
+) -> tuple[networks.FermiNetData, chex.PRNGKey, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+  """Proposes symmetric intra-layer coordinate swaps between opposite spins."""
+  cur_data = data
+  cur_key = key
+  cur_lp = lp_1
+  batch_size = cur_data.positions.shape[0]
+  num_states = max(
+      1, cur_data.positions.shape[1] // max(1, total_particles * ndim)
+  )
+  b_idx = jnp.arange(batch_size)[:, None]
+  s_idx = jnp.arange(num_states)[None, :]
+  acc_total = jnp.zeros((), dtype=jnp.float32)
+  try_total = jnp.zeros((), dtype=jnp.float32)
+  batch_f = jnp.asarray(float(batch_size), dtype=jnp.float32)
+
+  for up_start, up_end, dn_start, dn_end in swap_ranges:
+    cur_key, k_up, k_dn = jax.random.split(cur_key, 3)
+    x1 = cur_data.positions
+    pos_4d = jnp.reshape(x1, [batch_size, num_states, total_particles, ndim])
+    idx_up = jax.random.randint(
+        k_up, shape=(batch_size, num_states), minval=up_start, maxval=up_end
+    )
+    idx_dn = jax.random.randint(
+        k_dn, shape=(batch_size, num_states), minval=dn_start, maxval=dn_end
+    )
+    r_up = pos_4d[b_idx, s_idx, idx_up, :]
+    r_dn = pos_4d[b_idx, s_idx, idx_dn, :]
+    pos_prop = pos_4d.at[b_idx, s_idx, idx_up, :].set(r_dn)
+    pos_prop = pos_prop.at[b_idx, s_idx, idx_dn, :].set(r_up)
+    x2 = jnp.reshape(pos_prop, x1.shape)
+    lp_2 = 2.0 * f(
+        params, x2, cur_data.spins, cur_data.atoms, cur_data.charges
+    )
+    ratio = lp_2 - cur_lp
+    x_new, cur_key, cur_lp, step_acc = mh_accept(
+        x1, x2, cur_lp, lp_2, ratio, cur_key, 0.0
+    )
+    cur_data = networks.FermiNetData(
+        **(dict(cur_data) | {'positions': x_new})
+    )  # pyrefly: ignore[no-matching-overload]
+    acc_total = acc_total + jnp.sum(step_acc).astype(jnp.float32)
+    try_total = try_total + batch_f
+
+  return cur_data, cur_key, cur_lp, acc_total, try_total
+
+
 def make_mcmc_step(
     batch_network,
     batch_per_device,
@@ -1147,6 +1228,7 @@ def make_mcmc_step(
     pair_min_fraction: float = 2.0 / 3.0,
     pair_lattice: jnp.ndarray | np.ndarray | None = None,
     hop_vectors: jnp.ndarray | np.ndarray | None = None,
+    spin_swap_prob: float = 0.0,
     return_stats: bool = False,
 ):
   """Creates the MCMC step function.
@@ -1187,6 +1269,10 @@ def make_mcmc_step(
       neighbor moire lattice vector while leaving all other particles fixed).
     hop_vectors: Optional `(n_vectors, ndim)` array of explicit inter-well
       lattice translation vectors.
+    spin_swap_prob: Probability in [0, 1] of proposing a symmetric intra-layer
+      spatial coordinate swap `(r_{i,up} <-> r_{j,dn})` at the end of each MCMC
+      sweep. Defaults to 0.0 (disabled). Swap acceptances are excluded from
+      `pmove` so Gaussian step-size adaptation is unaffected.
     return_stats: If True, `mcmc_step` returns `(new_data, stats_dict)` with
       separate ordinary/pair attempt and acceptance counts, acceptance rates,
       pair-map rejection rate, Metropolis rejection rate, and mean number of
@@ -1214,9 +1300,19 @@ def make_mcmc_step(
     raise ValueError(
         f'pair_min_fraction must be in [0, 1], got {pair_min_fraction}.'
     )
+  spin_swap_prob = float(spin_swap_prob)
+  if not 0.0 <= spin_swap_prob <= 1.0:
+    raise ValueError(
+        f'spin_swap_prob must be in [0, 1], got {spin_swap_prob}.'
+    )
 
   resolved_layer_counts = _resolve_layer_counts(nspins, layer_counts)
   n_e, n_h = resolved_layer_counts
+  swap_ranges = _resolve_spin_swap_ranges(nspins, layer_counts)
+  total_swap_particles = (
+      int(sum(nspins)) if nspins is not None else int(n_e + n_h)
+  )
+  use_spin_swap = (spin_swap_prob > 0.0) and (len(swap_ranges) > 0)
   use_pair_moves = (pair_prob > 0.0) and (n_e > 0) and (n_h > 0)
   min_pairs_required = pair_min_fraction * float(min(n_e, n_h))
   if use_pair_moves and pair_radius <= 0.0:
@@ -1257,23 +1353,7 @@ def make_mcmc_step(
   latch_state = {'pair_moves_enabled': pair_min_fraction <= 0.0}
 
   def mcmc_step(params, data, key, width) -> tuple[networks.FermiNetData, Any]:
-    """Performs a set of MCMC steps.
-
-    Args:
-      params: parameters to pass to the network.
-      data: (batched) MCMC configurations to pass to the network.
-      key: RNG state.
-      width: standard deviation to use in the move proposal. May be a scalar
-        (in which case ordinary moves use `width` and pair moves use
-        `width * pair_width_scale`), a length-2 array `[width_normal,
-        width_pair]`, or a length-3 array `[width_normal, width_pair,
-        pair_moves_enabled]` where the third entry is a latched warm-up flag
-        (0.0 before activation, 1.0 once activated).
-
-    Returns:
-      `(data, pmove)` when `return_stats=False`, or `(data, stats_dict)` when
-      `return_stats=True`.
-    """
+    """Performs a set of MCMC steps."""
     pos = data.positions
     width_arr = jnp.asarray(width)
     has_explicit_enable_flag = (
@@ -1297,8 +1377,8 @@ def make_mcmc_step(
         params, pos, data.spins, data.atoms, data.charges
     )
     
-    #Just normal MH update, no pair moves
-    if not use_pair_moves and not return_stats:
+    # Fast legacy MH update when neither pair moves, spin swaps, nor stats are requested
+    if not use_pair_moves and not use_spin_swap and not return_stats:
       def legacy_single_step_fn(i, x):
         return inner_fun( 
             params,
@@ -1368,8 +1448,6 @@ def make_mcmc_step(
           mode_key, p=pair_prob, shape=(max(1, steps),)
       )
       if steps >= 2:
-        # Guarantee at least one ordinary single-particle sweep per mcmc_step
-        # call so internal relative coordinates always equilibrate.
         do_pair_sweeps = jnp.where(
             jnp.all(do_pair_sweeps),
             do_pair_sweeps.at[0].set(False),
@@ -1385,9 +1463,16 @@ def make_mcmc_step(
       pair_gate_open = jnp.asarray(False, dtype=bool)
       do_pair_sweeps = jnp.zeros((max(1, steps),), dtype=bool)
 
+    if use_spin_swap:
+      key, swap_mode_key = jax.random.split(key)
+      do_swap_sweeps = jax.random.bernoulli(
+          swap_mode_key, p=spin_swap_prob, shape=(max(1, steps),)
+      )
+    else:
+      do_swap_sweeps = jnp.zeros((max(1, steps),), dtype=bool)
+
     batch_f = jnp.asarray(float(batch_per_device), dtype=jnp.float32)
 
-    # carry=(cur_data, cur_key, cur_lp, acc_n, try_n, acc_p, try_p, acc_p_active, try_p_active, map_rej_p, sum_pairs_p) and holds the current MCMC state and running diagnostics for the ordinary and pair moves. 
     def tracked_normal_step(i, carry):
       (
           cur_data,
@@ -1401,6 +1486,8 @@ def make_mcmc_step(
           try_p_active,
           map_rej_p,
           sum_pairs_p,
+          acc_swap,
+          try_swap,
       ) = carry
       next_data, next_key, next_lp, step_acc = inner_fun(
           params,
@@ -1416,8 +1503,8 @@ def make_mcmc_step(
           blocks=blocks,
           i=i,
       )
-      acc_n = acc_n + jnp.sum(step_acc).astype(jnp.float32) #step_acc is number of walkers accepted in this step on this GPU 
-      try_n = try_n + batch_f #batch_f is number of walkers on this GPU
+      acc_n = acc_n + jnp.sum(step_acc).astype(jnp.float32)
+      try_n = try_n + batch_f
       return (
           next_data,
           next_key,
@@ -1430,6 +1517,8 @@ def make_mcmc_step(
           try_p_active,
           map_rej_p,
           sum_pairs_p,
+          acc_swap,
+          try_swap,
       )
 
     def tracked_pair_step(i, carry):
@@ -1445,6 +1534,8 @@ def make_mcmc_step(
           try_p_active,
           map_rej_p,
           sum_pairs_p,
+          acc_swap,
+          try_swap,
       ) = carry
       (
           next_data,
@@ -1474,12 +1565,12 @@ def make_mcmc_step(
           unpaired_stddev=normal_width,
           hop_vectors=resolved_hop_vectors,
       )
-      acc_p = acc_p + jnp.sum(step_acc).astype(jnp.float32) #step_acc is number of walkers accepted in this step on this GPU
-      try_p = try_p + batch_f #batch_f is number of walkers on this GPU
-      acc_p_active = acc_p_active + jnp.sum(step_acc_active).astype(jnp.float32) #Walker being active just means that is has at least one pair
+      acc_p = acc_p + jnp.sum(step_acc).astype(jnp.float32)
+      try_p = try_p + batch_f
+      acc_p_active = acc_p_active + jnp.sum(step_acc_active).astype(jnp.float32)
       try_p_active = try_p_active + jnp.sum(step_try_active).astype(jnp.float32)
-      map_rej_p = map_rej_p + jnp.sum(step_map_rej).astype(jnp.float32) #Number of walker proposals rejected due to pairing map changed after proposal
-      sum_pairs_p = sum_pairs_p + jnp.sum(step_pairs).astype(jnp.float32) #step_pairs is sum of number of pairs over all walkers on this GPU, sum_pairs_p accumulates over all paired-update steps. This is to calculate mean_num_pairs, which is the mean number of pairs per walker over all paired-update steps.
+      map_rej_p = map_rej_p + jnp.sum(step_map_rej).astype(jnp.float32)
+      sum_pairs_p = sum_pairs_p + jnp.sum(step_pairs).astype(jnp.float32)
       return (
           next_data,
           next_key,
@@ -1492,26 +1583,80 @@ def make_mcmc_step(
           try_p_active,
           map_rej_p,
           sum_pairs_p,
+          acc_swap,
+          try_swap,
       )
 
-    # To get the normal or pair step depending on do_pair_sweeps
+    def maybe_spin_swap_step(i, carry):
+      if not use_spin_swap:
+        return carry
+      is_end_of_sweep = (i + 1) % blocks == 0
+      do_swap = is_end_of_sweep & do_swap_sweeps[i // blocks]
+
+      def _do_swap_fn(c):
+        (
+            c_data,
+            c_key,
+            c_lp,
+            acc_n,
+            try_n,
+            acc_p,
+            try_p,
+            acc_p_active,
+            try_p_active,
+            map_rej_p,
+            sum_pairs_p,
+            acc_swap,
+            try_swap,
+        ) = c
+        n_data, n_key, n_lp, s_acc, s_try = _mh_spin_swap_update(
+            params=params,
+            f=batch_network,
+            data=c_data,
+            key=c_key,
+            lp_1=c_lp,
+            swap_ranges=swap_ranges,
+            total_particles=total_swap_particles,
+            ndim=ndim,
+        )
+        return (
+            n_data,
+            n_key,
+            n_lp,
+            acc_n,
+            try_n,
+            acc_p,
+            try_p,
+            acc_p_active,
+            try_p_active,
+            map_rej_p,
+            sum_pairs_p,
+            acc_swap + s_acc,
+            try_swap + s_try,
+        )
+
+      return lax.cond(do_swap, _do_swap_fn, lambda c: c, carry)
+
     def step_fn(i, carry):
       if not use_pair_moves:
-        return tracked_normal_step(i, carry)
-      # do_pair_sweeps is boolean array of length steps, indicating whether to do a pair move or not for each step.
-      do_pair = do_pair_sweeps[i // blocks] # i//blocks determine which block we're in
-      return lax.cond(
-          do_pair,
-          lambda args: tracked_pair_step(*args),
-          lambda args: tracked_normal_step(*args),
-          (i, carry),
-      )
+        carry = tracked_normal_step(i, carry)
+      else:
+        do_pair = do_pair_sweeps[i // blocks]
+        carry = lax.cond(
+            do_pair,
+            lambda args: tracked_pair_step(*args),
+            lambda args: tracked_normal_step(*args),
+            (i, carry),
+        )
+      return maybe_spin_swap_step(i, carry)
 
     zero_f = jnp.zeros((), dtype=jnp.float32)
     init_carry = (
         data,
         key,
         logprob,
+        zero_f,
+        zero_f,
         zero_f,
         zero_f,
         zero_f,
@@ -1534,9 +1679,11 @@ def make_mcmc_step(
         n_try_pair_active,
         n_map_rej_pair,
         sum_pairs,
-    ) = lax.fori_loop(0, nsteps, step_fn, init_carry) #So here we run the MCMC steps, and get the final data, key, and the accumulated statistics for normal and pair moves.
+        n_acc_spin_swap,
+        n_try_spin_swap,
+    ) = lax.fori_loop(0, nsteps, step_fn, init_carry)
 
-    n_acc_normal = _safe_psum(n_acc_normal) #constants.psum sums a value across the devices participating in the parallel calculation
+    n_acc_normal = _safe_psum(n_acc_normal)
     n_try_normal = _safe_psum(n_try_normal)
     n_acc_pair = _safe_psum(n_acc_pair)
     n_try_pair = _safe_psum(n_try_pair)
@@ -1544,7 +1691,11 @@ def make_mcmc_step(
     n_try_pair_active = _safe_psum(n_try_pair_active)
     n_map_rej_pair = _safe_psum(n_map_rej_pair)
     sum_pairs = _safe_psum(sum_pairs)
+    n_acc_spin_swap = _safe_psum(n_acc_spin_swap)
+    n_try_spin_swap = _safe_psum(n_try_spin_swap)
 
+    # Keep `pmove` strictly reflecting spatial moves so Gaussian step-size
+    # adaptation (`update_mcmc_width`) is never distorted by discrete swaps.
     total_acc = n_acc_normal + n_acc_pair
     total_try = n_try_normal + n_try_pair
     pmove = jnp.where(
@@ -1568,6 +1719,11 @@ def make_mcmc_step(
         n_acc_pair_active / jnp.maximum(n_try_pair_active, 1.0),
         jnp.nan,
     )
+    pmove_spin_swap = jnp.where(
+        n_try_spin_swap > 0.0,
+        n_acc_spin_swap / jnp.maximum(n_try_spin_swap, 1.0),
+        jnp.nan,
+    )
     pair_map_reject_rate = jnp.where(
         n_try_pair > 0.0,
         n_map_rej_pair / jnp.maximum(n_try_pair, 1.0),
@@ -1589,12 +1745,15 @@ def make_mcmc_step(
         'pmove_normal': pmove_normal,
         'pmove_pair': pmove_pair,
         'pmove_pair_active': pmove_pair_active,
+        'pmove_spin_swap': pmove_spin_swap,
         'n_try_normal': n_try_normal,
         'n_acc_normal': n_acc_normal,
         'n_try_pair': n_try_pair,
         'n_acc_pair': n_acc_pair,
         'n_try_pair_active': n_try_pair_active,
         'n_acc_pair_active': n_acc_pair_active,
+        'n_try_spin_swap': n_try_spin_swap,
+        'n_acc_spin_swap': n_acc_spin_swap,
         'n_map_rej_pair': n_map_rej_pair,
         'n_mh_rej_pair': n_mh_rej_pair,
         'pair_map_reject_rate': pair_map_reject_rate,

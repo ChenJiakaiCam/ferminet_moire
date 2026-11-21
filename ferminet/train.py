@@ -473,7 +473,9 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         system.pyscf_mol_to_internal_representation(cfg.system.pyscf_mol))
 
   from ferminet.moire import geometry as moire_geometry  # pylint: disable=g-import-not-at-top
+  cfg = moire_geometry.apply_moire_anisotropic_config(cfg)
   cfg = moire_geometry.apply_moire_charges_config(cfg)
+  cfg = moire_geometry.apply_moire_gate_config(cfg)
   cfg = moire_geometry.apply_moire_unit_cell_config(cfg)
 
   # Convert mol config into array of atomic positions and charges
@@ -886,6 +888,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
           cfg.network.make_feature_layer_kwargs['primitive_lattice'],
           dtype=np.float64,
       )
+  spin_swap_prob = float(cfg.mcmc.get('spin_swap_prob', 0.0))
   mcmc_step = mcmc.make_mcmc_step(
       batch_network,
       device_batch_size,
@@ -900,6 +903,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
       pair_width_scale=pair_width_scale,
       pair_min_fraction=pair_min_fraction,
       pair_lattice=pair_lattice,
+      spin_swap_prob=spin_swap_prob,
       return_stats=use_pair_mcmc,
   )
 
