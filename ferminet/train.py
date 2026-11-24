@@ -473,6 +473,7 @@ def train(cfg: ml_collections.ConfigDict, writer_manager=None):
         system.pyscf_mol_to_internal_representation(cfg.system.pyscf_mol))
 
   from ferminet.moire import geometry as moire_geometry  # pylint: disable=g-import-not-at-top
+  cfg = moire_geometry.apply_moire_anisotropic_config(cfg)
   cfg = moire_geometry.apply_moire_unit_cell_config(cfg)
 
   # Convert mol config into array of atomic positions and charges
